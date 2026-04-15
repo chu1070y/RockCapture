@@ -1,4 +1,4 @@
-# LakeHouse
+# RockCapture
 
 MySQL 데이터를 MinIO(S3 호환) 오브젝트 스토리지에 Apache Iceberg 형식으로 적재하는 데이터 파이프라인입니다.
 
