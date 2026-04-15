@@ -1,0 +1,32 @@
+# 민감한 설정 파일 (DB 비밀번호, MinIO 키 등 포함)
+pipeline.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 로그
+logs/
+*.log
+
+# 메타데이터 (DB 구조 및 binlog 정보)
+metadata/
+
+# JDBC 드라이버 (용량 큰 JAR 파일)
+# drivers/*.jar
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

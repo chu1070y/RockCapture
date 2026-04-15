@@ -1,0 +1,35 @@
+mysql:
+  host: 10.64.23.29
+  port: "3306"
+  user: gwchu
+  password: {패스워드}
+  jdbc_jar_path: drivers/mysql-connector-j-9.2.0.jar
+  # MariaDB 사용 시: jdbc_driver: org.mariadb.jdbc.Driver
+  jdbc_driver: com.mysql.cj.jdbc.Driver
+
+minio:
+  endpoint: http://10.65.50.111:9000
+  access_key: admin
+  secret_key: {패스워드}
+  bucket: gwchu-data
+  region: us-east-1
+  ssl_enabled: false
+
+spark:
+  app_name: LakeHouse
+  log_level: INFO
+  driver_memory: 3g
+
+iceberg:
+  catalog_name: lakehouse
+  warehouse: s3a://gwchu-data/iceberg-warehouse
+
+logging:
+  level: INFO   # DEBUG / INFO / WARNING / ERROR
+
+pipeline:
+  num_threads: 4
+  chunk_size: 100000               # JDBC 파티션당 행 수 (num_partitions 계산용)
+  large_table_threshold: 1000000   # 이 행 수 이상이면 대형 테이블로 분류
+  large_table_batch_size: 1000000  # 대형 테이블 PK 범위 배치 크기
+  large_table_workers: 3           # 대형 테이블 동시 처리 수
