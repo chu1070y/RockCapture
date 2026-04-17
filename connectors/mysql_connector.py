@@ -224,7 +224,29 @@ class MySQLConnector(BaseDBConnector):
             hi = int(row[1]) if row[1] is not None else 0
             log.debug("MIN/MAX  (%s.%s.%s = %d ~ %d)", db, table, pk, lo, hi)
 
-        return {"db": db, "table": table, "count": count, "pk": pk, "lo": lo, "hi": hi}
+        # 숫자형 PK가 없으면 임의 타입 PK를 찾아 해시 배치용으로 사용
+        text_pk = None
+        if not pk:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT k.COLUMN_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE k
+                    WHERE k.TABLE_SCHEMA    = %s
+                      AND k.TABLE_NAME      = %s
+                      AND k.CONSTRAINT_NAME = 'PRIMARY'
+                    ORDER BY k.ORDINAL_POSITION
+                    LIMIT 1
+                    """,
+                    (db, table),
+                )
+                row = cur.fetchone()
+            text_pk = row[0] if row else None
+            if text_pk:
+                log.debug("텍스트 PK (해시 배치용)  (%s.%s = %s)", db, table, text_pk)
+
+        return {"db": db, "table": table, "count": count,
+                "pk": pk, "lo": lo, "hi": hi, "text_pk": text_pk}
 
     def collect_all_table_stats(
         self, db_tables: dict[str, list[str]]
@@ -258,5 +280,8 @@ class MySQLConnector(BaseDBConnector):
                 row_counts[key] = r["count"]
                 if r["pk"]:
                     pk_info[key] = (r["pk"], r["lo"], r["hi"])
+                elif r.get("text_pk"):
+                    # 숫자형 PK 없음 → 텍스트 PK (해시 배치): lo=hi=-1 로 sentinel 표시
+                    pk_info[key] = (r["text_pk"], -1, -1)
 
         return row_counts, pk_info

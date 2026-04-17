@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,34 +15,31 @@ def _load_yaml(path: str) -> dict:
 # ── DB 설정 기반 클래스 ────────────────────────────────────────────
 
 
-class BaseDBConfig:
-    """
-    MySQL / PostgreSQL 설정이 공통으로 구현해야 하는 인터페이스.
-
-    - jdbc_url              : JDBC 연결 URL (property)
-    - jdbc_driver           : JDBC 드라이버 클래스 이름 (property)
-    - session_init_statement: Spark JDBC 커넥션 열릴 때 실행할 SQL (property, 기본 "")
-    - fqn(schema, table)    : SQL에서 사용할 풀 테이블 이름 (DB 방언에 맞는 따옴표)
-    - column_ref(col)       : 컬럼 이름을 DB 방언에 맞게 따옴표로 감싸기
-    """
+class BaseDBConfig(ABC):
+    """MySQL / PostgreSQL 설정 공통 인터페이스."""
 
     @property
-    def jdbc_url(self) -> str:
-        raise NotImplementedError
+    @abstractmethod
+    def jdbc_url(self) -> str: ...
 
     @property
-    def jdbc_driver(self) -> str:
-        raise NotImplementedError
+    @abstractmethod
+    def jdbc_driver(self) -> str: ...
 
     @property
     def session_init_statement(self) -> str:
         return ""
 
-    def fqn(self, schema: str, table: str) -> str:
-        raise NotImplementedError
+    @abstractmethod
+    def fqn(self, schema: str, table: str) -> str: ...
 
-    def column_ref(self, col: str) -> str:
-        raise NotImplementedError
+    @abstractmethod
+    def column_ref(self, col: str) -> str: ...
+
+    @abstractmethod
+    def hash_mod_expr(self, col: str, total: int, bucket: int) -> str:
+        """hash(col) % total = bucket 형태의 WHERE 절 반환."""
+        ...
 
 
 # ── MySQL ─────────────────────────────────────────────────────────
@@ -54,7 +52,6 @@ class MySQLConfig(BaseDBConfig):
     user: str = "root"
     password: str = ""
     jdbc_jar_path: str = "drivers/mysql-connector-j-9.2.0.jar"
-    _jdbc_driver: str = "com.mysql.cj.jdbc.Driver"
 
     @property
     def jdbc_url(self) -> str:
@@ -65,7 +62,7 @@ class MySQLConfig(BaseDBConfig):
 
     @property
     def jdbc_driver(self) -> str:
-        return self._jdbc_driver
+        return "com.mysql.cj.jdbc.Driver"
 
     @property
     def session_init_statement(self) -> str:
@@ -77,6 +74,9 @@ class MySQLConfig(BaseDBConfig):
     def column_ref(self, col: str) -> str:
         return f"`{col}`"
 
+    def hash_mod_expr(self, col: str, total: int, bucket: int) -> str:
+        # CRC32는 UNSIGNED 반환이므로 ABS 불필요
+        return f"MOD(CRC32(`{col}`), {total}) = {bucket}"
 
 
 # ── PostgreSQL ────────────────────────────────────────────────────
@@ -84,22 +84,12 @@ class MySQLConfig(BaseDBConfig):
 
 @dataclass
 class PostgreSQLConfig(BaseDBConfig):
-    """
-    PostgreSQL 연결 설정.
-
-    - database  : 접속할 PostgreSQL 데이터베이스 이름
-                  (MySQL의 스키마 역할은 list_databases()가 pg 스키마 목록을 반환하는 방식으로 매핑)
-    - jdbc_jar_path: PostgreSQL JDBC 드라이버 JAR 경로
-                     (예: drivers/postgresql-42.7.4.jar)
-    """
-
     host: str = "localhost"
     port: str = "5432"
     user: str = "postgres"
     password: str = ""
     database: str = "postgres"
-    jdbc_jar_path: str = "drivers/postgresql-42.7.4.jar"
-    _jdbc_driver: str = "org.postgresql.Driver"
+    jdbc_jar_path: str = "drivers/postgresql-42.7.9.jar"
 
     @property
     def jdbc_url(self) -> str:
@@ -107,12 +97,13 @@ class PostgreSQLConfig(BaseDBConfig):
 
     @property
     def jdbc_driver(self) -> str:
-        return self._jdbc_driver
+        return "org.postgresql.Driver"
 
     @property
     def session_init_statement(self) -> str:
-        # PostgreSQL JDBC는 별도 세션 초기화 불필요
-        return ""
+        # 각 Spark JDBC 커넥션의 격리 수준을 REPEATABLE READ로 설정.
+        # MySQL의 "START TRANSACTION WITH CONSISTENT SNAPSHOT"에 대응.
+        return "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 
     def fqn(self, schema: str, table: str) -> str:
         return f'"{schema}"."{table}"'
@@ -120,6 +111,9 @@ class PostgreSQLConfig(BaseDBConfig):
     def column_ref(self, col: str) -> str:
         return f'"{col}"'
 
+    def hash_mod_expr(self, col: str, total: int, bucket: int) -> str:
+        # HASHTEXT는 음수를 반환할 수 있으므로 ABS 처리
+        return f'MOD(ABS(HASHTEXT("{col}")), {total}) = {bucket}'
 
 
 # ── 기타 설정 ─────────────────────────────────────────────────────
@@ -133,8 +127,7 @@ class LoggingConfig:
     def from_yaml(cls, path: str = "pipeline.yaml") -> LoggingConfig:
         s = _load_yaml(path).get("logging", {})
         level_str = str(s.get("level", "INFO")).upper()
-        level = getattr(logging, level_str, logging.INFO)
-        return cls(level=level)
+        return cls(level=getattr(logging, level_str, logging.INFO))
 
 
 @dataclass
@@ -145,9 +138,6 @@ class MinIOConfig:
     bucket: str = "lakehouse"
     region: str = "us-east-1"
     ssl_enabled: bool = False
-
-    def path(self, database: str, table: str) -> str:
-        return f"s3a://{self.bucket}/{database}/{table}/"
 
     @classmethod
     def from_yaml(cls, path: str = "pipeline.yaml") -> MinIOConfig:

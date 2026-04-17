@@ -3,7 +3,8 @@ main.py — LakeHouse Pipeline FastAPI 서버
 
 엔드포인트:
     POST /pipeline/run           파이프라인 실행 (백그라운드, job_id 반환)
-    GET  /pipeline/status/{id}   실행 상태 조회
+    POST /pipeline/cancel?job_id=  실행 중인 job 중단 요청
+    GET  /pipeline/status?job_id=  실행 상태 조회
     GET  /pipeline/jobs          전체 job 목록 조회
     GET  /health                 헬스체크
 """
@@ -34,14 +35,18 @@ app = FastAPI(
 
 
 class JobStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCESS = "success"
-    FAILED  = "failed"
+    PENDING   = "pending"
+    RUNNING   = "running"
+    SUCCESS   = "success"
+    FAILED    = "failed"
+    CANCELLED = "cancelled"
 
 
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+
+# job_id → cancel Event (RUNNING 상태인 동안만 보관)
+_cancel_events: dict[str, threading.Event] = {}
 
 
 # ── 요청 / 응답 모델 ──────────────────────────────────────────────
@@ -91,14 +96,17 @@ class JobInfo(BaseModel):
     started_at: str
     elapsed:    Optional[str] = None
     error:      Optional[str] = None
+    cancelled_at: Optional[str] = None
 
 
 # ── 백그라운드 실행 함수 ──────────────────────────────────────────
 
 
 def _run_pipeline_job(job_id: str, req: PipelineRequest) -> None:
+    cancel_event = threading.Event()
     with _jobs_lock:
         _jobs[job_id]["status"] = JobStatus.RUNNING
+        _cancel_events[job_id]  = cancel_event
 
     try:
         pipeline = LakehousePipeline(
@@ -112,17 +120,29 @@ def _run_pipeline_job(job_id: str, req: PipelineRequest) -> None:
             pg_jdbc_jar=req.pg_jdbc_jar,
             config_file=req.config_file,
         )
-        elapsed_str = pipeline.run()
+        elapsed_str = pipeline.run(cancel_event=cancel_event)
 
-        with _jobs_lock:
-            _jobs[job_id]["status"]  = JobStatus.SUCCESS
-            _jobs[job_id]["elapsed"] = elapsed_str
+        if cancel_event.is_set():
+            with _jobs_lock:
+                _jobs[job_id]["status"] = JobStatus.CANCELLED
+        else:
+            with _jobs_lock:
+                _jobs[job_id]["status"]  = JobStatus.SUCCESS
+                _jobs[job_id]["elapsed"] = elapsed_str
 
     except Exception as e:
-        log.exception("Job %s 실패: %s", job_id, e)
+        if cancel_event.is_set():
+            log.info("Job %s 중단 완료", job_id)
+            with _jobs_lock:
+                _jobs[job_id]["status"] = JobStatus.CANCELLED
+        else:
+            log.exception("Job %s 실패: %s", job_id, e)
+            with _jobs_lock:
+                _jobs[job_id]["status"] = JobStatus.FAILED
+                _jobs[job_id]["error"]  = str(e)
+    finally:
         with _jobs_lock:
-            _jobs[job_id]["status"] = JobStatus.FAILED
-            _jobs[job_id]["error"]  = str(e)
+            _cancel_events.pop(job_id, None)
 
 
 # ── 엔드포인트 ────────────────────────────────────────────────────
@@ -160,7 +180,7 @@ async def run_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
 
 
 @app.get(
-    "/pipeline/status/{job_id}",
+    "/pipeline/status",
     response_model=JobInfo,
     summary="Job 상태 조회",
 )
@@ -180,6 +200,34 @@ async def get_status(job_id: str):
 async def list_jobs():
     with _jobs_lock:
         return [JobInfo(**j) for j in _jobs.values()]
+
+
+@app.post(
+    "/pipeline/cancel",
+    summary="Job 중단",
+    description="실행 중인 파이프라인 job에 취소 신호를 전달합니다. 즉시 중단이 아닌 graceful 중단입니다.",
+)
+async def cancel_job(job_id: str):
+    with _jobs_lock:
+        job   = _jobs.get(job_id)
+        event = _cancel_events.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' 를 찾을 수 없습니다.")
+    if job["status"] != JobStatus.RUNNING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job_id '{job_id}' 는 현재 '{job['status']}' 상태입니다. RUNNING 상태일 때만 중단할 수 있습니다.",
+        )
+    if event is None:
+        raise HTTPException(status_code=500, detail="취소 이벤트를 찾을 수 없습니다.")
+
+    event.set()
+    with _jobs_lock:
+        _jobs[job_id]["cancelled_at"] = datetime.now().isoformat(timespec="seconds")
+
+    log.info("Job 중단 요청  (job_id=%s)", job_id)
+    return {"job_id": job_id, "message": "중단 요청이 전달되었습니다. 현재 작업 완료 후 중단됩니다."}
 
 
 @app.get("/health", summary="헬스체크")

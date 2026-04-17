@@ -26,14 +26,14 @@ class SparkSessionManager:
         iceberg_cfg: IcebergConfig,
     ):
         self._spark_cfg = spark_cfg
-        self._mysql_cfg = db_cfg   # 내부적으로 동일 이름 유지 (jdbc_jar_path 참조)
+        self._db_cfg = db_cfg
         self._minio_cfg = minio_cfg
         self._iceberg_cfg = iceberg_cfg
         self._session: SparkSession | None = None
 
     def build(self) -> SparkSession:
         log.info("SparkSession 생성 시작  (app=%s)", self._spark_cfg.app_name)
-        log.debug("JDBC jar: %s", self._mysql_cfg.jdbc_jar_path)
+        log.debug("JDBC jar: %s", self._db_cfg.jdbc_jar_path)
         log.debug("extra packages: %s", self._spark_cfg.extra_packages)
         log.debug("MinIO endpoint: %s", self._minio_cfg.endpoint)
 
@@ -43,7 +43,7 @@ class SparkSessionManager:
             SparkSession.builder
             .appName(self._spark_cfg.app_name)
             .config("spark.driver.memory", self._spark_cfg.driver_memory)
-            .config("spark.driver.extraClassPath", self._mysql_cfg.jdbc_jar_path)
+            .config("spark.driver.extraClassPath", self._db_cfg.jdbc_jar_path)
             .config(
                 "spark.jars.packages",
                 ",".join(self._spark_cfg.extra_packages),

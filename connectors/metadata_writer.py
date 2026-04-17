@@ -75,22 +75,12 @@ class MetadataWriter:
         log.info("메타데이터 로컬 저장 완료  (path=%s)", path)
         return path
 
-    def save_to_minio(self, meta: SnapshotMetadata, spark, base_path: str) -> None:
-        """MinIO에 단일 JSON 파일로 저장 (db_type·날짜 기반 경로)"""
-        from pyspark.sql.types import StringType
-
-        json_str = json.dumps(meta.to_dict(), ensure_ascii=False)
-        df = spark.createDataFrame([json_str], StringType())
-        path = f"{base_path.rstrip('/')}/{self._file_name(meta)}/"
-        df.coalesce(1).write.mode("overwrite").text(path)
-        log.info("메타데이터 MinIO 저장 완료  (path=%s)", path)
-
     def save_replication_status_to_minio(self, meta: SnapshotMetadata, minio_cfg) -> None:
         """복제 위치(binlog 또는 WAL) 상태값만 추출하여 MinIO에 저장.
 
         저장 경로:
-          - MySQL      : _metadata/mysql_{YYYYMMDD}_binlog_status.json
-          - PostgreSQL : _metadata/postgresql_{YYYYMMDD}_wal_status.json
+          - MySQL      : snapshot_status/mysql_{YYYYMMDD}_binlog_status.json
+          - PostgreSQL : snapshot_status/postgresql_{YYYYMMDD}_wal_status.json
         """
         import boto3
         from botocore.config import Config
@@ -104,7 +94,7 @@ class MetadataWriter:
                 "wal_offset":  meta.binlog_position,
                 "wal_lsn":     meta.executed_gtid_set,
             }
-            object_key = f"_metadata/postgresql_{date_str}_wal_status.json"
+            object_key = f"snapshot_status/postgresql_{date_str}_wal_status.json"
         else:
             payload = {
                 "snapshot_at":       meta.snapshot_at,
@@ -114,7 +104,7 @@ class MetadataWriter:
                 "binlog_ignore_db":  meta.binlog_ignore_db,
                 "executed_gtid_set": meta.executed_gtid_set,
             }
-            object_key = f"_metadata/mysql_{date_str}_binlog_status.json"
+            object_key = f"snapshot_status/mysql_{date_str}_binlog_status.json"
 
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 

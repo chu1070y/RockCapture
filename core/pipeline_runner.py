@@ -39,20 +39,21 @@ class TableTask:
     upper_bound: int          # PK MAX
     num_partitions: int       # Spark JDBC 병렬 파티션 수
     result: TableResult
-    batch_size: int = 0       # 0=전체 읽기, >0=PK 범위 배치 적재
+    batch_size: int = 0              # 0=전체 읽기, >0=배치 적재
     pg_database: str | None = None  # PostgreSQL 전용: 실제 데이터베이스명 (Iceberg 최상위 namespace)
+    hash_partition_col: str | None = None  # 텍스트 PK 해시 배치용 컬럼 (pk_column이 None일 때만 설정)
 
 
 def _iceberg_namespace(task: "TableTask") -> list[str]:
     """
     Iceberg 저장 경로의 namespace 목록 반환.
 
-    MySQL      : [db]              → catalog.db.table
-    PostgreSQL : [pg_database, db] → catalog.pg_database.schema.table
+    MySQL      : [mysql,      db]              → warehouse/mysql/db/table
+    PostgreSQL : [postgresql, pg_database, db] → warehouse/postgresql/pg_database/schema/table
     """
     if task.pg_database:
-        return [task.pg_database, task.db]
-    return [task.db]
+        return ["postgresql", task.pg_database, task.db]
+    return ["mysql", task.db]
 
 
 # ── JDBC 유틸 ─────────────────────────────────────────────────
@@ -123,6 +124,78 @@ def _read_jdbc_range(
     return spark.read.format("jdbc").options(**opts).load()
 
 
+def _read_jdbc_ctid_parallel(
+    spark: SparkSession,
+    db_cfg: BaseDBConfig,
+    db: str,
+    table: str,
+    total_pages: int,
+    n_partitions: int,
+    fetch_size: int = 10_000,
+):
+    """
+    PostgreSQL ctid 기반 병렬 읽기.
+
+    Spark JDBC predicates API를 사용하므로 WHERE 절이 서브쿼리 없이 테이블에
+    직접 적용된다. PostgreSQL이 TID Range Scan을 사용할 수 있어 각 파티션이
+    해당 페이지 구간만 읽는다.
+
+    predicates = [
+        "ctid >= '(0,0)'::tid  AND ctid < '(5000,0)'::tid",   # 파티션 0
+        "ctid >= '(5000,0)'::tid AND ctid < '(10000,0)'::tid", # 파티션 1
+        ...
+        "ctid >= '(N,0)'::tid",                                 # 마지막 파티션
+    ]
+    모든 파티션은 Spark에서 병렬로 실행된다.
+    """
+    pages_per_part = max(1, math.ceil(total_pages / n_partitions))
+    predicates = []
+    for i in range(n_partitions):
+        lo = i * pages_per_part
+        if i < n_partitions - 1:
+            hi = (i + 1) * pages_per_part
+            predicates.append(f"ctid >= '({lo},0)'::tid AND ctid < '({hi},0)'::tid")
+        else:
+            predicates.append(f"ctid >= '({lo},0)'::tid")
+
+    props = {
+        "user":      db_cfg.user,
+        "password":  db_cfg.password,
+        "driver":    db_cfg.jdbc_driver,
+        "fetchsize": str(fetch_size),
+    }
+    if db_cfg.session_init_statement:
+        props["sessionInitStatement"] = db_cfg.session_init_statement
+
+    return spark.read.jdbc(
+        url=db_cfg.jdbc_url,
+        table=db_cfg.fqn(db, table),
+        predicates=predicates,
+        properties=props,
+    )
+
+
+def _read_jdbc_hash_batch(
+    spark: SparkSession,
+    db_cfg: BaseDBConfig,
+    db: str,
+    table: str,
+    hash_col: str,
+    bucket: int,
+    total_buckets: int,
+    fetch_size: int = 10_000,
+):
+    """MySQL 텍스트 PK용: hash(col) % total = bucket 조건으로 한 버킷만 읽기."""
+    where = db_cfg.hash_mod_expr(hash_col, total_buckets, bucket)
+    query = f"(SELECT * FROM {db_cfg.fqn(db, table)} WHERE {where}) AS t"
+    opts = {
+        **_jdbc_base_options(db_cfg),
+        "dbtable":   query,
+        "fetchsize": str(fetch_size),
+    }
+    return spark.read.format("jdbc").options(**opts).load()
+
+
 # ── 배치 적재 ─────────────────────────────────────────────────
 
 def _load_in_batches(
@@ -165,6 +238,35 @@ def _load_in_batches(
     log.info("%s 배치 적재 완료  %s.%s  (%d배치)", tag, task.db, task.table, batch_num)
 
 
+
+
+def _load_in_hash_batches(
+    tag: str,
+    task: "TableTask",
+    spark: SparkSession,
+    db_cfg: BaseDBConfig,
+    minio: MinIOConnector,
+) -> None:
+    """MySQL 텍스트 PK 테이블용 해시 배치 적재 (폴백)."""
+    n_buckets = math.ceil(task.total_rows / task.batch_size)
+    log.info(
+        "%s hash 배치 적재 시작  %s.%s  (rows=%d, buckets=%d, hash_col=%s)",
+        tag, task.db, task.table, task.total_rows, n_buckets, task.hash_partition_col,
+    )
+    ns = _iceberg_namespace(task)
+    for bucket in range(n_buckets):
+        log.info("%s hash 배치 %d/%d", tag, bucket + 1, n_buckets)
+        df = _read_jdbc_hash_batch(
+            spark, db_cfg, task.db, task.table,
+            task.hash_partition_col, bucket, n_buckets,
+        )
+        if bucket == 0:
+            minio.write_iceberg(df, ns, task.table)
+        else:
+            minio.append_iceberg(df, ns, task.table)
+    log.info("%s hash 배치 적재 완료  %s.%s  (%d버킷)", tag, task.db, task.table, n_buckets)
+
+
 # ── 워커 ─────────────────────────────────────────────────────
 
 def _worker(
@@ -185,13 +287,28 @@ def _worker(
 
         try:
             log.info(
-                "%s 시작  %s.%s  (rows=%d, partitions=%d, pk=%s, batch_size=%s)",
+                "%s 시작  %s.%s  (rows=%d, partitions=%d, pk=%s, hash_col=%s, batch_size=%s)",
                 tag, task.db, task.table,
-                task.total_rows, task.num_partitions, task.pk_column,
+                task.total_rows, task.num_partitions,
+                task.pk_column or "-",
+                task.hash_partition_col or "-",
                 task.batch_size if task.batch_size > 0 else "없음",
             )
-            if task.batch_size > 0 and task.pk_column:
+            if task.pk_column == "__ctid__":
+                log.info(
+                    "%s ctid 병렬 읽기  %s.%s  (rows=%d, pages=%d, partitions=%d)",
+                    tag, task.db, task.table, task.total_rows,
+                    task.upper_bound, task.num_partitions,
+                )
+                df = _read_jdbc_ctid_parallel(
+                    spark, db_cfg, task.db, task.table,
+                    task.upper_bound, task.num_partitions,
+                )
+                minio.write_iceberg(df, _iceberg_namespace(task), task.table)
+            elif task.batch_size > 0 and task.pk_column:
                 _load_in_batches(tag, task, spark, db_cfg, minio)
+            elif task.batch_size > 0 and task.hash_partition_col:
+                _load_in_hash_batches(tag, task, spark, db_cfg, minio)
             else:
                 df = _read_jdbc(
                     spark, db_cfg,
@@ -277,6 +394,33 @@ def build_flat_tables(
             total_rows = row_counts[(db, table)]
             pk_col, lo, hi = pk_info.get((db, table), (None, 0, 0))
 
+            # __ctid__ sentinel: PostgreSQL ctid 페이지 범위 배치
+            # lo=hi=-1  sentinel: MySQL 텍스트 PK 해시 배치
+            hash_col: str | None = None
+            if pk_col == "__ctid__":
+                # ctid 병렬 읽기: num_partitions 개의 페이지 구간을 Spark가 병렬로 읽음
+                num_partitions = min(
+                    math.ceil(total_rows / cfg.chunk_size),
+                    cfg.num_threads,
+                )
+                num_partitions = max(num_partitions, 1)
+                tasks.append(TableTask(
+                    db=db, table=table,
+                    total_rows=total_rows,
+                    pk_column="__ctid__",
+                    lower_bound=lo,          # 0
+                    upper_bound=hi,          # relpages
+                    num_partitions=num_partitions,
+                    result=result_map[(db, table)],
+                    batch_size=0,            # 순차 배치 없음 — Spark 내부 병렬 처리
+                    pg_database=pg_database,
+                ))
+                continue
+
+            if pk_col and hi == -1:
+                hash_col = pk_col
+                pk_col, lo, hi = None, 0, 0
+
             if pk_col and hi > lo:
                 num_partitions = min(
                     math.ceil(total_rows / cfg.chunk_size),
@@ -287,7 +431,12 @@ def build_flat_tables(
                 num_partitions = 1
 
             is_large = total_rows >= cfg.large_table_threshold
-            batch_size = cfg.large_table_batch_size if (is_large and pk_col and hi > lo) else 0
+            if is_large and pk_col and hi > lo:
+                batch_size = cfg.large_table_batch_size   # 숫자 PK 범위 배치
+            elif is_large and hash_col:
+                batch_size = cfg.large_table_batch_size   # 텍스트 PK 해시 배치
+            else:
+                batch_size = 0
 
             tasks.append(TableTask(
                 db=db, table=table,
@@ -299,6 +448,7 @@ def build_flat_tables(
                 result=result_map[(db, table)],
                 batch_size=batch_size,
                 pg_database=pg_database,
+                hash_partition_col=hash_col,
             ))
     return tasks
 
@@ -355,6 +505,7 @@ def run_parallel_load(
     db_cfg: BaseDBConfig,
     minio: MinIOConnector,
     cfg: PipelineConfig,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """
     Spark JDBC 기반 병렬 적재 실행.
@@ -362,11 +513,13 @@ def run_parallel_load(
     소형 테이블 (num_threads 워커) + 대형 테이블 (large_table_workers 워커) 를
     동시에 병렬 실행한다.
     2차: 실패 테이블 재시도. 재시도도 실패 시 SystemExit(1).
-    """
-    stop_event = threading.Event()
 
-    small_tasks = [t for t in tasks if t.total_rows < cfg.large_table_threshold]
-    large_tasks = [t for t in tasks if t.total_rows >= cfg.large_table_threshold]
+    cancel_event가 주어지면 이를 stop_event로 사용하여 외부에서 중단 가능.
+    """
+    stop_event = cancel_event if cancel_event is not None else threading.Event()
+
+    small_tasks = [t for t in tasks if t.total_rows < cfg.large_table_threshold and t.pk_column != "__ctid__"]
+    large_tasks = [t for t in tasks if t.total_rows >= cfg.large_table_threshold or t.pk_column == "__ctid__"]
 
     log.info(
         "적재 분류  (소형=%d개, 대형=%d개, 임계값=%d rows) — 동시 병렬 실행",
@@ -390,8 +543,8 @@ def run_parallel_load(
     )
 
     # 2차: 실패 테이블 재시도 (소형·대형 동시 실행)
-    retry_small = [t for t in failed if t.total_rows < cfg.large_table_threshold]
-    retry_large = [t for t in failed if t.total_rows >= cfg.large_table_threshold]
+    retry_small = [t for t in failed if t.total_rows < cfg.large_table_threshold and t.pk_column != "__ctid__"]
+    retry_large = [t for t in failed if t.total_rows >= cfg.large_table_threshold or t.pk_column == "__ctid__"]
 
     second_failed = _run_phase(
         retry_small, retry_large, stop_event, spark, db_cfg, minio, cfg,

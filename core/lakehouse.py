@@ -5,6 +5,7 @@ LakehousePipeline 클래스가 파이프라인 전체 단계를 순서대로 수
 FastAPI 요청 모델(PipelineRequest)을 직접 받아 동작하므로
 main.py(API 레이어)와 분리되어 독립적으로 테스트·재사용 가능하다.
 """
+import threading
 import time
 
 from core.config import (
@@ -133,7 +134,7 @@ class LakehousePipeline:
 
     # ── 공개 API ──────────────────────────────────────────────────
 
-    def run(self) -> str:
+    def run(self, cancel_event: threading.Event | None = None) -> str:
         """파이프라인 전체 단계를 순서대로 실행하고 소요시간 문자열을 반환한다."""
         _start = time.monotonic()
         log.info("===== LakeHouse 파이프라인 시작 =====")
@@ -182,15 +183,12 @@ class LakehousePipeline:
                 db_tables, row_counts, pk_info, snapshot_meta, self._pipeline_cfg,
                 pg_database=pg_database,
             )
-            run_parallel_load(tasks, spark, self._db_cfg, minio, self._pipeline_cfg)
+            run_parallel_load(tasks, spark, self._db_cfg, minio, self._pipeline_cfg,
+                              cancel_event=cancel_event)
 
             # 5. 메타데이터 저장
             log.info("[5] 메타데이터 저장")
             metadata_writer.save_local(snapshot_meta)
-            metadata_writer.save_to_minio(
-                snapshot_meta, spark,
-                f"s3a://{self._minio_cfg.bucket}/_metadata/snapshot",
-            )
             metadata_writer.save_replication_status_to_minio(snapshot_meta, self._minio_cfg)
 
         elapsed = int(time.monotonic() - _start)

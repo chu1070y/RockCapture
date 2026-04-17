@@ -26,7 +26,6 @@ from datetime import datetime
 from queue import Queue
 
 import psycopg2
-import psycopg2.extras
 
 from core.config import PostgreSQLConfig
 from connectors.base_connector import BaseDBConnector
@@ -297,7 +296,25 @@ class PostgreSQLConnector(BaseDBConnector):
             hi = int(row[1]) if row and row[1] is not None else 0
             log.debug("MIN/MAX  (%s.%s.%s = %d ~ %d)", schema, table, pk, lo, hi)
 
-        return {"db": schema, "table": table, "count": count, "pk": pk, "lo": lo, "hi": hi}
+        # 숫자형 PK가 없으면 pg_class.relpages 로 ctid 페이지 범위 배치 정보 수집
+        ctid_pages = 0
+        if not pk:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.relpages
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s AND c.relname = %s
+                    """,
+                    (schema, table),
+                )
+                row = cur.fetchone()
+            ctid_pages = int(row[0]) if row and row[0] else 0
+            log.debug("ctid 배치용 relpages  (%s.%s = %d)", schema, table, ctid_pages)
+
+        return {"db": schema, "table": table, "count": count,
+                "pk": pk, "lo": lo, "hi": hi, "ctid_pages": ctid_pages}
 
     def collect_all_table_stats(
         self, db_tables: dict[str, list[str]]
@@ -333,5 +350,9 @@ class PostgreSQLConnector(BaseDBConnector):
                 row_counts[key] = r["count"]
                 if r["pk"]:
                     pk_info[key] = (r["pk"], r["lo"], r["hi"])
+                elif r.get("ctid_pages", 0) > 0:
+                    # 숫자형 PK 없음 → ctid 페이지 범위 배치
+                    # sentinel: pk_column="__ctid__", lo=0, hi=relpages
+                    pk_info[key] = ("__ctid__", 0, r["ctid_pages"])
 
         return row_counts, pk_info
