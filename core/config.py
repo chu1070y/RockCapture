@@ -11,6 +11,120 @@ def _load_yaml(path: str) -> dict:
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
+# ── DB 설정 기반 클래스 ────────────────────────────────────────────
+
+
+class BaseDBConfig:
+    """
+    MySQL / PostgreSQL 설정이 공통으로 구현해야 하는 인터페이스.
+
+    - jdbc_url              : JDBC 연결 URL (property)
+    - jdbc_driver           : JDBC 드라이버 클래스 이름 (property)
+    - session_init_statement: Spark JDBC 커넥션 열릴 때 실행할 SQL (property, 기본 "")
+    - fqn(schema, table)    : SQL에서 사용할 풀 테이블 이름 (DB 방언에 맞는 따옴표)
+    - column_ref(col)       : 컬럼 이름을 DB 방언에 맞게 따옴표로 감싸기
+    """
+
+    @property
+    def jdbc_url(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def jdbc_driver(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def session_init_statement(self) -> str:
+        return ""
+
+    def fqn(self, schema: str, table: str) -> str:
+        raise NotImplementedError
+
+    def column_ref(self, col: str) -> str:
+        raise NotImplementedError
+
+
+# ── MySQL ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class MySQLConfig(BaseDBConfig):
+    host: str = "localhost"
+    port: str = "3306"
+    user: str = "root"
+    password: str = ""
+    jdbc_jar_path: str = "drivers/mysql-connector-j-9.2.0.jar"
+    _jdbc_driver: str = "com.mysql.cj.jdbc.Driver"
+
+    @property
+    def jdbc_url(self) -> str:
+        return (
+            f"jdbc:mysql://{self.host}:{self.port}/"
+            "?useSSL=false&serverTimezone=UTC&allowMultiQueries=true"
+        )
+
+    @property
+    def jdbc_driver(self) -> str:
+        return self._jdbc_driver
+
+    @property
+    def session_init_statement(self) -> str:
+        return "START TRANSACTION WITH CONSISTENT SNAPSHOT"
+
+    def fqn(self, schema: str, table: str) -> str:
+        return f"`{schema}`.`{table}`"
+
+    def column_ref(self, col: str) -> str:
+        return f"`{col}`"
+
+
+
+# ── PostgreSQL ────────────────────────────────────────────────────
+
+
+@dataclass
+class PostgreSQLConfig(BaseDBConfig):
+    """
+    PostgreSQL 연결 설정.
+
+    - database  : 접속할 PostgreSQL 데이터베이스 이름
+                  (MySQL의 스키마 역할은 list_databases()가 pg 스키마 목록을 반환하는 방식으로 매핑)
+    - jdbc_jar_path: PostgreSQL JDBC 드라이버 JAR 경로
+                     (예: drivers/postgresql-42.7.4.jar)
+    """
+
+    host: str = "localhost"
+    port: str = "5432"
+    user: str = "postgres"
+    password: str = ""
+    database: str = "postgres"
+    jdbc_jar_path: str = "drivers/postgresql-42.7.4.jar"
+    _jdbc_driver: str = "org.postgresql.Driver"
+
+    @property
+    def jdbc_url(self) -> str:
+        return f"jdbc:postgresql://{self.host}:{self.port}/{self.database}"
+
+    @property
+    def jdbc_driver(self) -> str:
+        return self._jdbc_driver
+
+    @property
+    def session_init_statement(self) -> str:
+        # PostgreSQL JDBC는 별도 세션 초기화 불필요
+        return ""
+
+    def fqn(self, schema: str, table: str) -> str:
+        return f'"{schema}"."{table}"'
+
+    def column_ref(self, col: str) -> str:
+        return f'"{col}"'
+
+
+
+# ── 기타 설정 ─────────────────────────────────────────────────────
+
+
 @dataclass
 class LoggingConfig:
     level: int = logging.INFO
@@ -21,35 +135,6 @@ class LoggingConfig:
         level_str = str(s.get("level", "INFO")).upper()
         level = getattr(logging, level_str, logging.INFO)
         return cls(level=level)
-
-
-@dataclass
-class MySQLConfig:
-    host: str = "localhost"
-    port: str = "3306"
-    user: str = "root"
-    password: str = ""
-    jdbc_jar_path: str = "drivers/mysql-connector-j-9.2.0.jar"
-    jdbc_driver: str = "com.mysql.cj.jdbc.Driver"  # MariaDB: org.mariadb.jdbc.Driver
-
-    @property
-    def jdbc_url(self) -> str:
-        return (
-            f"jdbc:mysql://{self.host}:{self.port}/"
-            "?useSSL=false&serverTimezone=UTC&allowMultiQueries=true"
-        )
-
-    @classmethod
-    def from_yaml(cls, path: str = "pipeline.yaml") -> MySQLConfig:
-        s = _load_yaml(path).get("mysql", {})
-        return cls(
-            host=s.get("host", cls.host),
-            port=str(s.get("port", cls.port)),
-            user=s.get("user", cls.user),
-            password=s.get("password", cls.password),
-            jdbc_jar_path=s.get("jdbc_jar_path", cls.jdbc_jar_path),
-            jdbc_driver=s.get("jdbc_driver", cls.jdbc_driver),
-        )
 
 
 @dataclass
@@ -94,10 +179,10 @@ class IcebergConfig:
 @dataclass
 class PipelineConfig:
     num_threads: int = 4
-    chunk_size: int = 100_000          # JDBC 파티션당 행 수 (num_partitions 계산용)
-    large_table_threshold: int = 1_000_000   # 이 행 수 이상이면 대형 테이블로 분류
-    large_table_batch_size: int = 1_000_000  # 대형 테이블 PK 범위 배치 크기
-    large_table_workers: int = 3             # 대형 테이블 동시 처리 수
+    chunk_size: int = 100_000
+    large_table_threshold: int = 1_000_000
+    large_table_batch_size: int = 1_000_000
+    large_table_workers: int = 3
 
     @classmethod
     def from_yaml(cls, path: str = "pipeline.yaml") -> PipelineConfig:

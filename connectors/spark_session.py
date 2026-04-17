@@ -1,7 +1,7 @@
 import os
 import sys
 from pyspark.sql import SparkSession
-from core.config import MySQLConfig, MinIOConfig, SparkConfig, IcebergConfig
+from core.config import BaseDBConfig, MinIOConfig, SparkConfig, IcebergConfig
 from core.logger import get_logger
 
 # Windows에서 Spark 실행 시 winutils.exe 경로 설정
@@ -21,12 +21,12 @@ class SparkSessionManager:
     def __init__(
         self,
         spark_cfg: SparkConfig,
-        mysql_cfg: MySQLConfig,
+        db_cfg: BaseDBConfig,
         minio_cfg: MinIOConfig,
         iceberg_cfg: IcebergConfig,
     ):
         self._spark_cfg = spark_cfg
-        self._mysql_cfg = mysql_cfg
+        self._mysql_cfg = db_cfg   # 내부적으로 동일 이름 유지 (jdbc_jar_path 참조)
         self._minio_cfg = minio_cfg
         self._iceberg_cfg = iceberg_cfg
         self._session: SparkSession | None = None

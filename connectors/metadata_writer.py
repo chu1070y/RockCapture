@@ -1,6 +1,7 @@
 import io
 import json
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 
 from core.logger import get_logger
@@ -18,55 +19,104 @@ class TableResult:
 @dataclass
 class SnapshotMetadata:
     snapshot_at: str
-    binlog_file: str
-    binlog_position: int
-    binlog_do_db: str
-    binlog_ignore_db: str
-    executed_gtid_set: str
+    db_type: str          # "mysql" | "postgresql"
+    binlog_file: str      # MySQL: binlog 파일명 / PostgreSQL: WAL 세그먼트 파일명
+    binlog_position: int  # MySQL: binlog 오프셋   / PostgreSQL: WAL 세그먼트 오프셋
+    binlog_do_db: str     # MySQL 전용 (PostgreSQL: "")
+    binlog_ignore_db: str # MySQL 전용 (PostgreSQL: "")
+    executed_gtid_set: str  # MySQL: GTID 셋 / PostgreSQL: WAL LSN 전체 문자열
     tables: list[TableResult] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """
+        db_type에 맞는 키 이름으로 직렬화한 dict 반환.
+        - MySQL    : binlog_file / binlog_position / binlog_do_db / binlog_ignore_db / executed_gtid_set
+        - PostgreSQL: wal_file  / wal_offset       / wal_lsn
+        """
+        base = {
+            "snapshot_at": self.snapshot_at,
+            "db_type":     self.db_type,
+            "tables":      [asdict(t) for t in self.tables],
+        }
+        if self.db_type == "postgresql":
+            base.update({
+                "wal_file":   self.binlog_file,
+                "wal_offset": self.binlog_position,
+                "wal_lsn":    self.executed_gtid_set,
+            })
+        else:
+            base.update({
+                "binlog_file":       self.binlog_file,
+                "binlog_position":   self.binlog_position,
+                "binlog_do_db":      self.binlog_do_db,
+                "binlog_ignore_db":  self.binlog_ignore_db,
+                "executed_gtid_set": self.executed_gtid_set,
+            })
+        return base
 
 
 class MetadataWriter:
     """스냅숏 메타데이터를 로컬 파일 / MinIO에 저장"""
 
-    FILE_NAME = "metadata.json"
-
     def __init__(self, output_dir: str = "metadata"):
         self._output_dir = Path(output_dir)
 
+    @staticmethod
+    def _file_name(meta: SnapshotMetadata) -> str:
+        """'{db_type}_{YYYYMMDD}.json' 형식의 파일명 반환."""
+        date_str = datetime.fromisoformat(meta.snapshot_at).strftime("%Y%m%d")
+        return f"{meta.db_type}_{date_str}.json"
+
     def save_local(self, meta: SnapshotMetadata) -> Path:
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._output_dir / self.FILE_NAME
+        path = self._output_dir / self._file_name(meta)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+            json.dump(meta.to_dict(), f, ensure_ascii=False, indent=2)
         log.info("메타데이터 로컬 저장 완료  (path=%s)", path)
         return path
 
     def save_to_minio(self, meta: SnapshotMetadata, spark, base_path: str) -> None:
-        """MinIO에 단일 JSON 파일로 저장"""
+        """MinIO에 단일 JSON 파일로 저장 (db_type·날짜 기반 경로)"""
         from pyspark.sql.types import StringType
 
-        json_str = json.dumps(asdict(meta), ensure_ascii=False)
+        json_str = json.dumps(meta.to_dict(), ensure_ascii=False)
         df = spark.createDataFrame([json_str], StringType())
-        path = f"{base_path.rstrip('/')}/_metadata/"
+        path = f"{base_path.rstrip('/')}/{self._file_name(meta)}/"
         df.coalesce(1).write.mode("overwrite").text(path)
         log.info("메타데이터 MinIO 저장 완료  (path=%s)", path)
 
-    def save_binlog_status_to_minio(self, meta: SnapshotMetadata, minio_cfg) -> None:
-        """binlog 상태값만 추출하여 MinIO에 binlog_status.json으로 저장."""
+    def save_replication_status_to_minio(self, meta: SnapshotMetadata, minio_cfg) -> None:
+        """복제 위치(binlog 또는 WAL) 상태값만 추출하여 MinIO에 저장.
+
+        저장 경로:
+          - MySQL      : _metadata/mysql_{YYYYMMDD}_binlog_status.json
+          - PostgreSQL : _metadata/postgresql_{YYYYMMDD}_wal_status.json
+        """
         import boto3
         from botocore.config import Config
 
-        payload = {
-            "snapshot_at":       meta.snapshot_at,
-            "binlog_file":       meta.binlog_file,
-            "binlog_position":   meta.binlog_position,
-            "binlog_do_db":      meta.binlog_do_db,
-            "binlog_ignore_db":  meta.binlog_ignore_db,
-            "executed_gtid_set": meta.executed_gtid_set,
-        }
+        date_str = datetime.fromisoformat(meta.snapshot_at).strftime("%Y%m%d")
+
+        if meta.db_type == "postgresql":
+            payload = {
+                "snapshot_at": meta.snapshot_at,
+                "wal_file":    meta.binlog_file,
+                "wal_offset":  meta.binlog_position,
+                "wal_lsn":     meta.executed_gtid_set,
+            }
+            object_key = f"_metadata/postgresql_{date_str}_wal_status.json"
+        else:
+            payload = {
+                "snapshot_at":       meta.snapshot_at,
+                "binlog_file":       meta.binlog_file,
+                "binlog_position":   meta.binlog_position,
+                "binlog_do_db":      meta.binlog_do_db,
+                "binlog_ignore_db":  meta.binlog_ignore_db,
+                "executed_gtid_set": meta.executed_gtid_set,
+            }
+            object_key = f"_metadata/mysql_{date_str}_binlog_status.json"
+
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        object_key = "_metadata/binlog_status.json"
 
         s3 = boto3.client(
             "s3",
@@ -83,6 +133,6 @@ class MetadataWriter:
             ContentType="application/json",
         )
         log.info(
-            "binlog 상태 MinIO 저장 완료  (s3://%s/%s)",
+            "복제 상태 MinIO 저장 완료  (s3://%s/%s)",
             minio_cfg.bucket, object_key,
         )

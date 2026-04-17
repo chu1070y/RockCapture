@@ -1,12 +1,3 @@
-mysql:
-  host: 10.64.23.29
-  port: "3306"
-  user: gwchu
-  password: {패스워드}
-  jdbc_jar_path: drivers/mysql-connector-j-9.2.0.jar
-  # MariaDB 사용 시: jdbc_driver: org.mariadb.jdbc.Driver
-  jdbc_driver: com.mysql.cj.jdbc.Driver
-
 minio:
   endpoint: http://10.65.50.111:9000
   access_key: admin

@@ -1,3 +1,7 @@
+fastapi==0.135.3
+uvicorn==0.44.0
+pydantic==2.11.9
+psycopg2-binary==2.9.11
 boto3==1.42.89
 botocore==1.42.89
 cffi==2.0.0

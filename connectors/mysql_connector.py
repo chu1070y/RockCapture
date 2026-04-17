@@ -6,6 +6,7 @@ import pymysql
 import pymysql.cursors
 
 from core.config import MySQLConfig
+from connectors.base_connector import BaseDBConnector
 from connectors.metadata_writer import SnapshotMetadata, TableResult
 from core.logger import get_logger
 
@@ -14,7 +15,7 @@ log = get_logger(__name__)
 SYSTEM_DATABASES = {"information_schema", "performance_schema", "mysql", "sys"}
 
 
-class MySQLConnector:
+class MySQLConnector(BaseDBConnector):
     """
     pymysql 기반 MySQL 커넥터 (메타데이터 전용).
 
@@ -62,7 +63,7 @@ class MySQLConnector:
             self._conn = None
             log.info("MySQL 연결 종료")
 
-    def __enter__(self) -> "MySQLConnector":
+    def __enter__(self) -> "MySQLConnector":  # type: ignore[override]
         self.connect()
         return self
 
@@ -125,6 +126,7 @@ class MySQLConnector:
 
         meta = SnapshotMetadata(
             snapshot_at=datetime.now().isoformat(timespec="seconds"),
+            db_type="mysql",
             binlog_file=row[0],
             binlog_position=row[1],
             binlog_do_db=row[2],
