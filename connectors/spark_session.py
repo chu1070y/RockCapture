@@ -43,7 +43,7 @@ class SparkSessionManager:
             SparkSession.builder
             .appName(self._spark_cfg.app_name)
             .config("spark.driver.memory", self._spark_cfg.driver_memory)
-            .config("spark.driver.extraClassPath", self._db_cfg.jdbc_jar_path)
+            .config("spark.jars", self._db_cfg.jdbc_jar_path)
             .config(
                 "spark.jars.packages",
                 ",".join(self._spark_cfg.extra_packages),

@@ -163,6 +163,18 @@ async def run_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
 
     job_id = str(uuid.uuid4())
     with _jobs_lock:
+        running = next(
+            (j for j in _jobs.values()
+             if j["status"] in (JobStatus.PENDING, JobStatus.RUNNING)
+             and j["db_type"] == req.db_type.lower()
+             and j["host"] == req.host),
+            None,
+        )
+        if running:
+            raise HTTPException(
+                status_code=409,
+                detail=f"이미 실행 중인 job이 있습니다. (job_id={running['job_id']})",
+            )
         _jobs[job_id] = {
             "job_id":     job_id,
             "status":     JobStatus.PENDING,

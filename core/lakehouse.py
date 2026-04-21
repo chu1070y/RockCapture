@@ -143,7 +143,7 @@ class LakehousePipeline:
             self._db_type, self._db_cfg.host, self._db_cfg.port, self._db_cfg.user,
         )
 
-        metadata_writer = MetadataWriter(output_dir="metadata")
+        metadata_writer = MetadataWriter()
 
         with SparkSessionManager(
             self._spark_cfg, self._db_cfg, self._minio_cfg, self._iceberg_cfg
@@ -168,9 +168,18 @@ class LakehousePipeline:
                 db.open_worker_connections(workers=self._pipeline_cfg.num_threads)
                 db.unlock_tables()
 
+                # 스냅숏 직후 MinIO에 복제 상태 저장
+                log.info("[2.5] 스냅숏 메타데이터 MinIO 저장")
+                metadata_writer.save_replication_status_to_minio(snapshot_meta, self._minio_cfg)
+
                 # 3. 행 수 및 PK 정보 수집
                 log.info("[3/3] 행 수 및 PK 정보 수집")
-                row_counts, pk_info = db.collect_all_table_stats(db_tables)
+                stats = db.collect_all_table_stats(db_tables)
+                if len(stats) == 3:
+                    row_counts, pk_info, ctid_pages_map = stats
+                else:
+                    row_counts, pk_info = stats
+                    ctid_pages_map = {}
                 db.close_worker_connections()
 
             # 4. Spark JDBC 병렬 적재
@@ -182,14 +191,10 @@ class LakehousePipeline:
             tasks = build_flat_tables(
                 db_tables, row_counts, pk_info, snapshot_meta, self._pipeline_cfg,
                 pg_database=pg_database,
+                ctid_pages_map=ctid_pages_map,
             )
             run_parallel_load(tasks, spark, self._db_cfg, minio, self._pipeline_cfg,
                               cancel_event=cancel_event)
-
-            # 5. 메타데이터 저장
-            log.info("[5] 메타데이터 저장")
-            metadata_writer.save_local(snapshot_meta)
-            metadata_writer.save_replication_status_to_minio(snapshot_meta, self._minio_cfg)
 
         elapsed = int(time.monotonic() - _start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60

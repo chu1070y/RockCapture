@@ -296,35 +296,45 @@ class PostgreSQLConnector(BaseDBConnector):
             hi = int(row[1]) if row and row[1] is not None else 0
             log.debug("MIN/MAX  (%s.%s.%s = %d ~ %d)", schema, table, pk, lo, hi)
 
-        # 숫자형 PK가 없으면 pg_class.relpages 로 ctid 페이지 범위 배치 정보 수집
+        # pg_class.relpages: PK 유무와 관계없이 항상 수집 (ctid 배치 폴백에 필요)
         ctid_pages = 0
-        if not pk:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT c.relpages
-                    FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = %s AND c.relname = %s
-                    """,
-                    (schema, table),
-                )
-                row = cur.fetchone()
-            ctid_pages = int(row[0]) if row and row[0] else 0
-            log.debug("ctid 배치용 relpages  (%s.%s = %d)", schema, table, ctid_pages)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.relpages, s.avg_width
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                LEFT JOIN pg_stats s
+                    ON s.schemaname = n.nspname
+                   AND s.tablename  = c.relname
+                WHERE n.nspname = %s AND c.relname = %s
+                LIMIT 1
+                """,
+                (schema, table),
+            )
+            row = cur.fetchone()
+        if row and row[0]:
+            ctid_pages = int(row[0])
+        elif count > 0:
+            # ANALYZE 미실행으로 relpages=0인 경우: avg_width 또는 기본값(100 bytes)으로 추정
+            avg_width = int(row[1]) if row and row[1] else 100
+            ctid_pages = max(1, (count * avg_width) // 8192)
+        log.debug("relpages  (%s.%s = %d%s)", schema, table, ctid_pages,
+                  " (추정)" if row and not row[0] and count > 0 else "")
 
         return {"db": schema, "table": table, "count": count,
                 "pk": pk, "lo": lo, "hi": hi, "ctid_pages": ctid_pages}
 
     def collect_all_table_stats(
         self, db_tables: dict[str, list[str]]
-    ) -> tuple[dict, dict]:
+    ) -> tuple[dict, dict, dict]:
         """
         워커 커넥션 풀로 모든 테이블의 행 수·PK·MIN/MAX를 병렬 수집.
 
         Returns:
-            row_counts : {(schema, table): int}
-            pk_info    : {(schema, table): (pk_column, lower_bound, upper_bound)}
+            row_counts    : {(schema, table): int}
+            pk_info       : {(schema, table): (pk_column, lower_bound, upper_bound)}
+            ctid_pages_map: {(schema, table): int}  — 실제 relpages (PK 유무 무관)
         """
         if not self._worker_pool:
             raise RuntimeError(
@@ -334,6 +344,7 @@ class PostgreSQLConnector(BaseDBConnector):
         pairs = [(db, t) for db, tables in db_tables.items() for t in tables]
         row_counts: dict = {}
         pk_info: dict = {}
+        ctid_pages_map: dict = {}
 
         def fetch(schema: str, table: str) -> dict:
             conn = self._worker_pool.get()
@@ -348,11 +359,12 @@ class PostgreSQLConnector(BaseDBConnector):
                 r = future.result()
                 key = (r["db"], r["table"])
                 row_counts[key] = r["count"]
+                ctid_pages_map[key] = r.get("ctid_pages", 0)
                 if r["pk"]:
                     pk_info[key] = (r["pk"], r["lo"], r["hi"])
-                elif r.get("ctid_pages", 0) > 0:
+                elif not r["pk"] and r["count"] > 0:
                     # 숫자형 PK 없음 → ctid 페이지 범위 배치
-                    # sentinel: pk_column="__ctid__", lo=0, hi=relpages
-                    pk_info[key] = ("__ctid__", 0, r["ctid_pages"])
+                    # sentinel: pk_column="__ctid__", lo=0, hi=relpages (추정값 포함)
+                    pk_info[key] = ("__ctid__", 0, max(r.get("ctid_pages", 0), 1))
 
-        return row_counts, pk_info
+        return row_counts, pk_info, ctid_pages_map

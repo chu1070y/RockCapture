@@ -63,8 +63,8 @@ class MetadataWriter:
 
     @staticmethod
     def _file_name(meta: SnapshotMetadata) -> str:
-        """'{db_type}_{YYYYMMDD}.json' 형식의 파일명 반환."""
-        date_str = datetime.fromisoformat(meta.snapshot_at).strftime("%Y%m%d")
+        """'{db_type}_{YYYYMMDD_HHMMSS}.json' 형식의 파일명 반환."""
+        date_str = datetime.fromisoformat(meta.snapshot_at).strftime("%Y%m%d_%H%M%S")
         return f"{meta.db_type}_{date_str}.json"
 
     def save_local(self, meta: SnapshotMetadata) -> Path:
@@ -85,7 +85,7 @@ class MetadataWriter:
         import boto3
         from botocore.config import Config
 
-        date_str = datetime.fromisoformat(meta.snapshot_at).strftime("%Y%m%d")
+        date_str = datetime.fromisoformat(meta.snapshot_at).strftime("%Y%m%d_%H%M%S")
 
         if meta.db_type == "postgresql":
             payload = {
