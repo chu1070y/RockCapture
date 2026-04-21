@@ -4,9 +4,10 @@ from pyspark.sql import SparkSession
 from core.config import BaseDBConfig, MinIOConfig, SparkConfig, IcebergConfig
 from core.logger import get_logger
 
-# Windows에서 Spark 실행 시 winutils.exe 경로 설정
-os.environ.setdefault("HADOOP_HOME", r"C:\hadoop")
-os.environ.setdefault("hadoop.home.dir", r"C:\hadoop")
+# Windows 전용: winutils.exe 경로 설정 (리눅스는 불필요)
+if sys.platform == "win32":
+    os.environ.setdefault("HADOOP_HOME", r"C:\hadoop")
+    os.environ.setdefault("hadoop.home.dir", r"C:\hadoop")
 
 # Spark 워커가 현재 실행 중인 Python(venv)을 사용하도록 강제
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
@@ -85,7 +86,12 @@ class SparkSessionManager:
                 " -Dlog4j2.logger.spark_shutdown.name=org.apache.spark.util.ShutdownHookManager"
                 " -Dlog4j2.logger.spark_shutdown.level=OFF"
                 " -Dlog4j2.logger.iceberg_hadoop_ops.name=org.apache.iceberg.hadoop.HadoopTableOperations"
-                " -Dlog4j2.logger.iceberg_hadoop_ops.level=ERROR",
+                " -Dlog4j2.logger.iceberg_hadoop_ops.level=ERROR"
+                # Windows에서 Spark 종료 시 JAR 임시 파일 삭제 실패 오류 억제 (JVM 파일 락 한정 현상)
+                " -Dlog4j2.logger.java_utils.name=org.apache.spark.network.util.JavaUtils"
+                " -Dlog4j2.logger.java_utils.level=OFF"
+                " -Dlog4j2.logger.spark_utils.name=org.apache.spark.util.Utils"
+                " -Dlog4j2.logger.spark_utils.level=OFF",
             )
         )
         self._session = builder.getOrCreate()
