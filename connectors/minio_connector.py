@@ -56,3 +56,20 @@ class MinIOConnector:
         log.debug("Iceberg append  (table=%s)", fqn)
         df.writeTo(fqn).append()
         log.debug("Iceberg append 완료  (table=%s)", fqn)
+
+    def compact_iceberg(self, spark, namespace: list[str], table: str) -> None:
+        """rewrite_data_files로 배치 적재로 생긴 소형 파일을 128MB 단위로 병합."""
+        catalog   = self._iceberg_cfg.catalog_name
+        table_ref = ".".join(namespace + [table])
+        fqn       = self._fqn(namespace, table)
+        log.info("Iceberg compaction 시작  (table=%s)", fqn)
+        try:
+            spark.sql(
+                f"CALL `{catalog}`.system.rewrite_data_files("
+                f"table => '{table_ref}', "
+                f"options => map('target-file-size-bytes', '134217728')"
+                f")"
+            )
+            log.info("Iceberg compaction 완료  (table=%s)", fqn)
+        except Exception as e:
+            log.warning("Iceberg compaction 실패 (무시됨)  (table=%s): %s", fqn, e)

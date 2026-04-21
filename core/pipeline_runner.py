@@ -480,6 +480,7 @@ def build_flat_tables(
     cfg: PipelineConfig,
     pg_database: str | None = None,
     ctid_pages_map: dict | None = None,
+    single_shot: bool = False,
 ) -> list[TableTask]:
     """
     테이블 목록을 TableTask 리스트로 변환.
@@ -508,9 +509,9 @@ def build_flat_tables(
                     cfg.num_threads,
                 )
                 num_partitions = max(num_partitions, 1)
-                # 대형 테이블: 페이지 범위를 batch_size 단위로 순차 배치 적재
+                # single_shot이면 배치 없이 전체 한 번에 읽기
                 is_large = total_rows >= cfg.large_table_threshold
-                if is_large and hi > 0:
+                if not single_shot and is_large and hi > 0:
                     rows_per_page = max(1, math.ceil(total_rows / hi))
                     ctid_batch_pages = max(1, math.ceil(cfg.large_table_batch_size / rows_per_page))
                 else:
@@ -548,7 +549,7 @@ def build_flat_tables(
             # PostgreSQL인 경우 실제 relpages를 이용해 ctid 배치로 폴백
             pk_range_too_narrow = pk_col and (hi - lo + 1) < cfg.large_table_batch_size
 
-            if is_large and pk_range_too_narrow and pg_database is not None:
+            if not single_shot and is_large and pk_range_too_narrow and pg_database is not None:
                 actual_pages = (ctid_pages_map or {}).get((db, table), 0)
                 if actual_pages > 0:
                     rows_per_page    = max(1, math.ceil(total_rows / actual_pages))
@@ -573,9 +574,9 @@ def build_flat_tables(
                     continue
                 # relpages 정보 없으면 단건 읽기로 진행 (fallthrough)
 
-            if is_large and pk_col and hi > lo:
+            if not single_shot and is_large and pk_col and hi > lo:
                 batch_size = cfg.large_table_batch_size   # 숫자 PK 범위 배치
-            elif is_large and hash_col:
+            elif not single_shot and is_large and hash_col:
                 batch_size = cfg.large_table_batch_size   # 텍스트 PK 해시 배치
             else:
                 batch_size = 0
@@ -698,3 +699,26 @@ def run_parallel_load(
         log.critical("재시도 실패로 전체 종료  문제 테이블: %s", bad)
         stop_event.set()
         raise SystemExit(1)
+
+
+def run_compaction(
+    tasks: list[TableTask],
+    spark: SparkSession,
+    minio: MinIOConnector,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """배치 적재 테이블의 Iceberg 소형 파일을 순차 병합(compaction)."""
+    targets = [t for t in tasks if t.batch_size > 0 or t.ctid_batch_pages > 0]
+    if not targets:
+        log.info("compaction 대상 없음 (배치 적재 테이블 없음)")
+        return
+    log.info(
+        "Iceberg compaction 시작  (%d개 테이블): %s",
+        len(targets), [f"{t.db}.{t.table}" for t in targets],
+    )
+    for task in targets:
+        if cancel_event and cancel_event.is_set():
+            log.info("compaction 중단 (취소 요청)")
+            return
+        minio.compact_iceberg(spark, _iceberg_namespace(task), task.table)
+    log.info("Iceberg compaction 전체 완료")

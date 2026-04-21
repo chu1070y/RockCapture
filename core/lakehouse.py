@@ -28,7 +28,7 @@ from connectors import (
     SparkSessionManager,
 )
 from core.logger import get_logger, setup_logging
-from core.pipeline_runner import build_flat_tables, run_parallel_load
+from core.pipeline_runner import build_flat_tables, run_compaction, run_parallel_load
 
 log = get_logger(__name__)
 
@@ -73,6 +73,7 @@ class LakehousePipeline:
         mysql_jdbc_jar: str = "drivers/mysql-connector-j-9.2.0.jar",
         pg_jdbc_jar: str = "drivers/postgresql-42.7.9.jar",
         config_file: str = "pipeline.yaml",
+        single_shot: bool = False,
     ) -> None:
         db_type = db_type.lower()
         if db_type not in self.SUPPORTED_DB_TYPES:
@@ -81,7 +82,8 @@ class LakehousePipeline:
                 f"사용 가능: {sorted(self.SUPPORTED_DB_TYPES)}"
             )
 
-        self._db_type = db_type
+        self._db_type     = db_type
+        self._single_shot = single_shot
 
         logging_cfg        = LoggingConfig.from_yaml(config_file)
         self._minio_cfg    = MinIOConfig.from_yaml(config_file)
@@ -192,9 +194,15 @@ class LakehousePipeline:
                 db_tables, row_counts, pk_info, snapshot_meta, self._pipeline_cfg,
                 pg_database=pg_database,
                 ctid_pages_map=ctid_pages_map,
+                single_shot=self._single_shot,
             )
             run_parallel_load(tasks, spark, self._db_cfg, minio, self._pipeline_cfg,
                               cancel_event=cancel_event)
+
+            # 5. Iceberg compaction (배치 적재 테이블의 소형 파일 병합)
+            if not (cancel_event and cancel_event.is_set()):
+                log.info("[5] Iceberg compaction 시작")
+                run_compaction(tasks, spark, minio, cancel_event=cancel_event)
 
         elapsed = int(time.monotonic() - _start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60

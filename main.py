@@ -82,6 +82,12 @@ class PipelineRequest(BaseModel):
         description="MinIO / Spark / Iceberg / Pipeline 설정 YAML 경로",
     )
 
+    # ── 적재 방식 ─────────────────────────────────────────────────
+    single_shot: bool = Field(
+        False,
+        description="True이면 대형 테이블도 배치 분할 없이 한 번에 적재 (메모리 여유 시 사용)",
+    )
+
 
 class RunResponse(BaseModel):
     job_id:  str
@@ -119,6 +125,7 @@ def _run_pipeline_job(job_id: str, req: PipelineRequest) -> None:
             mysql_jdbc_jar=req.mysql_jdbc_jar,
             pg_jdbc_jar=req.pg_jdbc_jar,
             config_file=req.config_file,
+            single_shot=req.single_shot,
         )
         elapsed_str = pipeline.run(cancel_event=cancel_event)
 
