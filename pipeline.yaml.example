@@ -24,3 +24,4 @@ pipeline:
   large_table_threshold: 1000000   # 이 행 수 이상이면 대형 테이블로 분류
   large_table_batch_size: 1000000  # 대형 테이블 PK 범위 배치 크기
   large_table_workers: 3           # 대형 테이블 동시 처리 수
+  stats_max_age_seconds: 86400     # 이보다 오래된 통계만 ANALYZE 후 추정치 사용

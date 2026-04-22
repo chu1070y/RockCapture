@@ -44,6 +44,16 @@ class BaseDBConnector(ABC):
         """지정한 데이터베이스(스키마) 내 테이블 목록을 반환."""
         ...
 
+    @abstractmethod
+    def refresh_stale_table_stats(
+        self,
+        db_tables: dict[str, list[str]],
+        *,
+        max_age_seconds: int,
+    ) -> None:
+        """오래된 테이블 통계만 선택적으로 갱신."""
+        ...
+
     # ── 스냅숏 캡처 ───────────────────────────────────────────────
 
     @abstractmethod

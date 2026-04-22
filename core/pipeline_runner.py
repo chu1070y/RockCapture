@@ -101,6 +101,26 @@ def _read_jdbc(
     return spark.read.format("jdbc").options(**opts).load()
 
 
+def read_jdbc_where(
+    spark: SparkSession,
+    db_cfg: BaseDBConfig,
+    db: str,
+    table: str,
+    where_clause: str,
+    fetch_size: int = 10_000,
+):
+    query = (
+        f"(SELECT * FROM {db_cfg.fqn(db, table)} "
+        f"WHERE {where_clause}) AS filtered_snapshot"
+    )
+    opts = {
+        **_jdbc_base_options(db_cfg),
+        "dbtable": query,
+        "fetchsize": str(fetch_size),
+    }
+    return spark.read.format("jdbc").options(**opts).load()
+
+
 def _read_jdbc_range(
     spark: SparkSession,
     db_cfg: BaseDBConfig,

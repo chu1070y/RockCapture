@@ -1,21 +1,25 @@
 """
-main.py — LakeHouse Pipeline FastAPI 서버
+FastAPI entrypoint for the LakeHouse pipeline service.
 
-엔드포인트:
-    POST /pipeline/run           파이프라인 실행 (백그라운드, job_id 반환)
-    POST /pipeline/cancel?job_id=  실행 중인 job 중단 요청
-    GET  /pipeline/status?job_id=  실행 상태 조회
-    GET  /pipeline/jobs          전체 job 목록 조회
-    GET  /health                 헬스체크
+Endpoints
+    POST /pipeline/run
+    POST /pipeline/cancel?job_id=
+    GET  /pipeline/status?job_id=
+    GET  /pipeline/jobs
+    GET  /health
 """
+
+import multiprocessing as mp
 import threading
+import traceback
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from queue import Empty
+from typing import Any, Optional
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.lakehouse import LakehousePipeline
@@ -23,238 +27,385 @@ from core.logger import get_logger
 
 log = get_logger(__name__)
 
-# ── FastAPI 앱 ────────────────────────────────────────────────────
-
 app = FastAPI(
     title="LakeHouse Pipeline API",
-    description="MySQL / PostgreSQL → MinIO(Iceberg) 파이프라인 실행 API",
+    description="MySQL / PostgreSQL to MinIO(Iceberg) pipeline API",
     version="1.0.0",
 )
 
-# ── Job 상태 관리 ─────────────────────────────────────────────────
+_MP_CONTEXT = mp.get_context("spawn")
 
 
 class JobStatus(str, Enum):
-    PENDING   = "pending"
-    RUNNING   = "running"
-    SUCCESS   = "success"
-    FAILED    = "failed"
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
     CANCELLED = "cancelled"
 
 
-_jobs: dict[str, dict] = {}
+_jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
-
-# job_id → cancel Event (RUNNING 상태인 동안만 보관)
-_cancel_events: dict[str, threading.Event] = {}
-
-
-# ── 요청 / 응답 모델 ──────────────────────────────────────────────
+_cancel_events: dict[str, Any] = {}
+_job_processes: dict[str, Any] = {}
 
 
 class PipelineRequest(BaseModel):
-    # ── DB 접속 정보 (필수) ──────────────────────────────────────
-    db_type:  str = Field(..., description="DB 종류: 'mysql' 또는 'postgresql'")
-    host:     str = Field(..., description="DB 서버 호스트 (IP 또는 도메인)")
-    port:     int = Field(..., description="DB 포트 번호")
-    user:     str = Field(..., description="DB 접속 계정")
-    password: str = Field(..., description="DB 접속 비밀번호")
-
-    # ── PostgreSQL 전용 ───────────────────────────────────────────
+    db_type: str = Field(..., description="Database type: mysql or postgresql")
+    host: str = Field(..., description="Database host")
+    port: int = Field(..., description="Database port")
+    user: str = Field(..., description="Database user")
+    password: str = Field(..., description="Database password")
     pg_database: str = Field(
         "postgres",
-        description="접속할 PostgreSQL 데이터베이스 이름 (postgresql 전용)",
+        description="PostgreSQL database name",
     )
-
-    # ── JDBC JAR 경로 ─────────────────────────────────────────────
     mysql_jdbc_jar: str = Field(
         "drivers/mysql-connector-j-9.2.0.jar",
-        description="MySQL JDBC 드라이버 JAR 경로",
+        description="MySQL JDBC driver jar path",
     )
     pg_jdbc_jar: str = Field(
         "drivers/postgresql-42.7.9.jar",
-        description="PostgreSQL JDBC 드라이버 JAR 경로",
+        description="PostgreSQL JDBC driver jar path",
     )
-
-    # ── 설정 파일 ─────────────────────────────────────────────────
     config_file: str = Field(
         "pipeline.yaml",
-        description="MinIO / Spark / Iceberg / Pipeline 설정 YAML 경로",
+        description="Pipeline YAML config path",
     )
-
-    # ── 적재 방식 ─────────────────────────────────────────────────
     single_shot: bool = Field(
         False,
-        description="True이면 대형 테이블도 배치 분할 없이 한 번에 적재 (메모리 여유 시 사용)",
+        description="Load large tables without batch splitting",
     )
 
 
 class RunResponse(BaseModel):
-    job_id:  str
+    job_id: str
     message: str
 
 
 class JobInfo(BaseModel):
-    job_id:     str
-    status:     JobStatus
-    db_type:    str
-    host:       str
+    job_id: str
+    status: JobStatus
+    db_type: str
+    host: str
     started_at: str
-    elapsed:    Optional[str] = None
-    error:      Optional[str] = None
+    elapsed: Optional[str] = None
+    error: Optional[str] = None
     cancelled_at: Optional[str] = None
 
 
-# ── 백그라운드 실행 함수 ──────────────────────────────────────────
+class FilteredSnapshotRequest(PipelineRequest):
+    source_db: str = Field(
+        ...,
+        description="MySQL database name or PostgreSQL schema name",
+    )
+    source_table: str = Field(..., description="Source table name")
+    where_clause: str = Field(..., description="SQL WHERE clause without the WHERE keyword")
 
 
-def _run_pipeline_job(job_id: str, req: PipelineRequest) -> None:
-    cancel_event = threading.Event()
+def _build_pipeline(req_data: dict[str, Any]) -> LakehousePipeline:
+    return LakehousePipeline(
+        db_type=req_data["db_type"],
+        host=req_data["host"],
+        port=req_data["port"],
+        user=req_data["user"],
+        password=req_data["password"],
+        pg_database=req_data["pg_database"],
+        mysql_jdbc_jar=req_data["mysql_jdbc_jar"],
+        pg_jdbc_jar=req_data["pg_jdbc_jar"],
+        config_file=req_data["config_file"],
+        single_shot=req_data["single_shot"],
+    )
+
+
+def _run_pipeline_process(
+    req_data: dict[str, Any],
+    cancel_event: Any,
+    result_queue: Any,
+) -> None:
+    try:
+        pipeline = _build_pipeline(req_data)
+        job_type = req_data.get("job_type", "full")
+        if job_type == "filtered_snapshot":
+            elapsed_str = pipeline.run_filtered_snapshot(
+                source_db=req_data["source_db"],
+                source_table=req_data["source_table"],
+                where_clause=req_data["where_clause"],
+                cancel_event=cancel_event,
+            )
+        else:
+            elapsed_str = pipeline.run(cancel_event=cancel_event)
+
+        if cancel_event.is_set():
+            result_queue.put({"status": JobStatus.CANCELLED.value})
+        else:
+            result_queue.put(
+                {
+                    "status": JobStatus.SUCCESS.value,
+                    "elapsed": elapsed_str,
+                }
+            )
+    except BaseException as exc:  # noqa: BLE001
+        if cancel_event.is_set():
+            result_queue.put({"status": JobStatus.CANCELLED.value})
+            return
+
+        result_queue.put(
+            {
+                "status": JobStatus.FAILED.value,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        raise
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def _finalize_job(job_id: str, result: dict[str, Any], exit_code: int | None) -> None:
+    status = result.get("status")
+    error = result.get("error")
+
+    if status is None:
+        if exit_code == 0:
+            status = JobStatus.SUCCESS.value
+        else:
+            status = JobStatus.FAILED.value
+            error = error or f"Worker process exited with code {exit_code}"
+
     with _jobs_lock:
-        _jobs[job_id]["status"] = JobStatus.RUNNING
-        _cancel_events[job_id]  = cancel_event
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+
+        if status == JobStatus.SUCCESS.value:
+            job["status"] = JobStatus.SUCCESS
+            job["elapsed"] = result.get("elapsed")
+            job["error"] = None
+        elif status == JobStatus.CANCELLED.value:
+            job["status"] = JobStatus.CANCELLED
+        else:
+            job["status"] = JobStatus.FAILED
+            job["error"] = error
+
+
+def _watch_pipeline_job(job_id: str, process: Any, result_queue: Any) -> None:
+    result: dict[str, Any] = {}
 
     try:
-        pipeline = LakehousePipeline(
-            db_type=req.db_type,
-            host=req.host,
-            port=req.port,
-            user=req.user,
-            password=req.password,
-            pg_database=req.pg_database,
-            mysql_jdbc_jar=req.mysql_jdbc_jar,
-            pg_jdbc_jar=req.pg_jdbc_jar,
-            config_file=req.config_file,
-            single_shot=req.single_shot,
-        )
-        elapsed_str = pipeline.run(cancel_event=cancel_event)
+        process.join()
 
-        if cancel_event.is_set():
-            with _jobs_lock:
-                _jobs[job_id]["status"] = JobStatus.CANCELLED
-        else:
-            with _jobs_lock:
-                _jobs[job_id]["status"]  = JobStatus.SUCCESS
-                _jobs[job_id]["elapsed"] = elapsed_str
+        try:
+            result = result_queue.get_nowait()
+        except Empty:
+            result = {}
 
-    except Exception as e:
-        if cancel_event.is_set():
-            log.info("Job %s 중단 완료", job_id)
-            with _jobs_lock:
-                _jobs[job_id]["status"] = JobStatus.CANCELLED
-        else:
-            log.exception("Job %s 실패: %s", job_id, e)
-            with _jobs_lock:
-                _jobs[job_id]["status"] = JobStatus.FAILED
-                _jobs[job_id]["error"]  = str(e)
+        if result.get("traceback"):
+            log.error("Job %s failed in worker process\n%s", job_id, result["traceback"])
+
+        _finalize_job(job_id, result, process.exitcode)
     finally:
         with _jobs_lock:
             _cancel_events.pop(job_id, None)
+            _job_processes.pop(job_id, None)
+
+        try:
+            result_queue.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            process.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
-# ── 엔드포인트 ────────────────────────────────────────────────────
+def _start_pipeline_job(job_id: str, req_data: dict[str, Any]) -> None:
+    cancel_event = _MP_CONTEXT.Event()
+    result_queue = _MP_CONTEXT.Queue()
+    process = _MP_CONTEXT.Process(
+        target=_run_pipeline_process,
+        args=(req_data, cancel_event, result_queue),
+        name=f"lakehouse-job-{job_id}",
+    )
+
+    with _jobs_lock:
+        _jobs[job_id]["status"] = JobStatus.RUNNING
+        _cancel_events[job_id] = cancel_event
+        _job_processes[job_id] = process
+
+    try:
+        process.start()
+    except Exception as exc:  # noqa: BLE001
+        with _jobs_lock:
+            _jobs[job_id]["status"] = JobStatus.FAILED
+            _jobs[job_id]["error"] = str(exc)
+            _cancel_events.pop(job_id, None)
+            _job_processes.pop(job_id, None)
+
+        try:
+            result_queue.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+    watcher = threading.Thread(
+        target=_watch_pipeline_job,
+        args=(job_id, process, result_queue),
+        name=f"job-watcher-{job_id}",
+        daemon=True,
+    )
+    watcher.start()
 
 
 @app.post(
     "/pipeline/run",
     response_model=RunResponse,
-    summary="파이프라인 실행",
-    description="DB → MinIO(Iceberg) 파이프라인을 백그라운드로 실행하고 job_id를 반환합니다.",
+    summary="Run pipeline",
 )
-async def run_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
+async def run_pipeline(req: PipelineRequest):
     if req.db_type.lower() not in LakehousePipeline.SUPPORTED_DB_TYPES:
         raise HTTPException(
             status_code=422,
-            detail=f"지원하지 않는 db_type: '{req.db_type}'. 사용 가능: mysql, postgresql",
+            detail=f"Unsupported db_type: '{req.db_type}'. Use mysql or postgresql.",
         )
 
     job_id = str(uuid.uuid4())
+    req_data = req.model_dump()
+    req_data["job_type"] = "full"
+
     with _jobs_lock:
         running = next(
-            (j for j in _jobs.values()
-             if j["status"] in (JobStatus.PENDING, JobStatus.RUNNING)
-             and j["db_type"] == req.db_type.lower()
-             and j["host"] == req.host),
+            (
+                job for job in _jobs.values()
+                if job["status"] in (JobStatus.PENDING, JobStatus.RUNNING)
+                and job["db_type"] == req.db_type.lower()
+                and job["host"] == req.host
+            ),
             None,
         )
         if running:
             raise HTTPException(
                 status_code=409,
-                detail=f"이미 실행 중인 job이 있습니다. (job_id={running['job_id']})",
+                detail=f"A job is already running for that target. (job_id={running['job_id']})",
             )
+
         _jobs[job_id] = {
-            "job_id":     job_id,
-            "status":     JobStatus.PENDING,
-            "db_type":    req.db_type.lower(),
-            "host":       req.host,
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "db_type": req.db_type.lower(),
+            "host": req.host,
             "started_at": datetime.now().isoformat(timespec="seconds"),
-            "elapsed":    None,
-            "error":      None,
+            "elapsed": None,
+            "error": None,
+            "cancelled_at": None,
         }
 
-    background_tasks.add_task(_run_pipeline_job, job_id, req)
+    _start_pipeline_job(job_id, req_data)
 
-    log.info("Job 등록  (job_id=%s, db=%s, host=%s)", job_id, req.db_type, req.host)
-    return RunResponse(job_id=job_id, message="파이프라인이 백그라운드에서 시작되었습니다.")
+    log.info("Job registered  (job_id=%s, db=%s, host=%s)", job_id, req.db_type, req.host)
+    return RunResponse(job_id=job_id, message="Pipeline started in a background process.")
+
+
+@app.post(
+    "/pipeline/run-filtered",
+    response_model=RunResponse,
+    summary="Run filtered table snapshot",
+)
+async def run_filtered_snapshot(req: FilteredSnapshotRequest):
+    if req.db_type.lower() not in LakehousePipeline.SUPPORTED_DB_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported db_type: '{req.db_type}'. Use mysql or postgresql.",
+        )
+
+    job_id = str(uuid.uuid4())
+    req_data = req.model_dump()
+    req_data["job_type"] = "filtered_snapshot"
+
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "db_type": req.db_type.lower(),
+            "host": req.host,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "elapsed": None,
+            "error": None,
+            "cancelled_at": None,
+        }
+
+    _start_pipeline_job(job_id, req_data)
+
+    log.info(
+        "Filtered snapshot job registered  (job_id=%s, db=%s, source=%s.%s)",
+        job_id,
+        req.db_type,
+        req.source_db,
+        req.source_table,
+    )
+    return RunResponse(job_id=job_id, message="Filtered snapshot started in a background process.")
 
 
 @app.get(
     "/pipeline/status",
     response_model=JobInfo,
-    summary="Job 상태 조회",
+    summary="Get job status",
 )
 async def get_status(job_id: str):
     with _jobs_lock:
         job = _jobs.get(job_id)
+
     if not job:
-        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' 를 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' was not found.")
+
     return JobInfo(**job)
 
 
 @app.get(
     "/pipeline/jobs",
     response_model=list[JobInfo],
-    summary="전체 Job 목록 조회",
+    summary="List jobs",
 )
 async def list_jobs():
     with _jobs_lock:
-        return [JobInfo(**j) for j in _jobs.values()]
+        return [JobInfo(**job) for job in _jobs.values()]
 
 
 @app.post(
     "/pipeline/cancel",
-    summary="Job 중단",
-    description="실행 중인 파이프라인 job에 취소 신호를 전달합니다. 즉시 중단이 아닌 graceful 중단입니다.",
+    summary="Cancel job",
 )
 async def cancel_job(job_id: str):
     with _jobs_lock:
-        job   = _jobs.get(job_id)
+        job = _jobs.get(job_id)
         event = _cancel_events.get(job_id)
 
     if not job:
-        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' 를 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' was not found.")
+
     if job["status"] != JobStatus.RUNNING:
         raise HTTPException(
             status_code=409,
-            detail=f"job_id '{job_id}' 는 현재 '{job['status']}' 상태입니다. RUNNING 상태일 때만 중단할 수 있습니다.",
+            detail=f"job_id '{job_id}' is '{job['status']}'. Only RUNNING jobs can be cancelled.",
         )
+
     if event is None:
-        raise HTTPException(status_code=500, detail="취소 이벤트를 찾을 수 없습니다.")
+        raise HTTPException(status_code=500, detail="Cancel event was not found for this job.")
 
     event.set()
     with _jobs_lock:
         _jobs[job_id]["cancelled_at"] = datetime.now().isoformat(timespec="seconds")
 
-    log.info("Job 중단 요청  (job_id=%s)", job_id)
-    return {"job_id": job_id, "message": "중단 요청이 전달되었습니다. 현재 작업 완료 후 중단됩니다."}
+    log.info("Job cancel requested  (job_id=%s)", job_id)
+    return {"job_id": job_id, "message": "Cancel request delivered."}
 
 
-@app.get("/health", summary="헬스체크")
+@app.get("/health", summary="Health check")
 async def health():
     return {"status": "ok"}
 
-
-# ── 실행 진입점 ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(

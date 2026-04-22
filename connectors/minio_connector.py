@@ -25,7 +25,6 @@ class MinIOConnector:
     """MinIO(S3A) 위에 Iceberg 테이블 적재."""
 
     def __init__(self, cfg: MinIOConfig, iceberg_cfg: IcebergConfig):
-        self._cfg = cfg
         self._iceberg_cfg = iceberg_cfg
         log.debug(
             "MinIOConnector 초기화  (endpoint=%s, bucket=%s, catalog=%s)",
@@ -67,7 +66,7 @@ class MinIOConnector:
             spark.sql(
                 f"CALL `{catalog}`.system.rewrite_data_files("
                 f"table => '{table_ref}', "
-                f"options => map('target-file-size-bytes', '134217728')"
+                f"options => map('target-file-size-bytes', '268435456')"
                 f")"
             )
             log.info("Iceberg compaction 완료  (table=%s)", fqn)

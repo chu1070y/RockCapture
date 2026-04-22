@@ -1,4 +1,5 @@
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -6,41 +7,52 @@ LOG_DIR = Path("logs")
 
 _FMT = "%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
+_SETUP_LOCK = threading.Lock()
+_IS_CONFIGURED = False
 
 
 def setup_logging(level: int = logging.INFO) -> None:
     """
-    애플리케이션 전체 로깅 초기화.
-    main.py 진입점에서 1회 호출.
+    Initialize application logging.
 
-    - 콘솔: INFO 이상 출력
-    - 파일:  DEBUG 이상, logs/lakehouse_YYYYMMDD_HHMMSS.log (실행마다 신규 파일)
+    This function is intentionally idempotent because the pipeline object is
+    created per API request. Without the guard, each request would append new
+    handlers to the root logger and every later log line would be duplicated.
     """
-    LOG_DIR.mkdir(exist_ok=True)
+    global _IS_CONFIGURED
 
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = LOG_DIR / f"lakehouse_{run_ts}.log"
+    with _SETUP_LOCK:
+        root = logging.getLogger()
+        root.setLevel(level)
 
-    formatter = logging.Formatter(_FMT, datefmt=_DATE_FMT)
+        if _IS_CONFIGURED:
+            for noisy in ("py4j", "pyspark"):
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+            return
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
+        LOG_DIR.mkdir(exist_ok=True)
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = LOG_DIR / f"lakehouse_{run_ts}.log"
 
-    root = logging.getLogger()
-    root.setLevel(level)
-    root.addHandler(console_handler)
-    root.addHandler(file_handler)
+        formatter = logging.Formatter(_FMT, datefmt=_DATE_FMT)
 
-    # pyspark / py4j 내부 로그 억제
-    for noisy in ("py4j", "pyspark"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+
+        root.addHandler(console_handler)
+        root.addHandler(file_handler)
+
+        for noisy in ("py4j", "pyspark"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+        _IS_CONFIGURED = True
 
 
 def get_logger(name: str) -> logging.Logger:
-    """모듈별 logger 반환. 각 파일에서 get_logger(__name__) 으로 사용."""
     return logging.getLogger(name)

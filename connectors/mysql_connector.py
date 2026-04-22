@@ -81,6 +81,16 @@ class MySQLConnector(BaseDBConnector):
         if self._conn is None:
             raise RuntimeError("MySQL 커넥션이 없습니다. connect() 또는 with 구문을 먼저 사용하세요.")
 
+    def _make_admin_conn(self) -> pymysql.Connection:
+        return pymysql.connect(
+            host=self._cfg.host,
+            port=int(self._cfg.port),
+            user=self._cfg.user,
+            password=self._cfg.password,
+            autocommit=True,
+            cursorclass=pymysql.cursors.Cursor,
+        )
+
     # ── DB / 테이블 목록 ──────────────────────────────────────
 
     def list_databases(self) -> list[str]:
@@ -98,6 +108,90 @@ class MySQLConnector(BaseDBConnector):
             tables = [r[0] for r in cur.fetchall()]
         log.info("  └─ %s: 테이블 %d개  %s", database, len(tables), tables)
         return tables
+
+    def _get_table_stats_age_seconds(
+        self,
+        conn: pymysql.Connection,
+        db: str,
+        table: str,
+    ) -> int | None:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT TIMESTAMPDIFF(
+                               SECOND,
+                               COALESCE(ts.last_update, t.UPDATE_TIME, t.CREATE_TIME),
+                               NOW()
+                           )
+                    FROM information_schema.TABLES t
+                    LEFT JOIN mysql.innodb_table_stats ts
+                      ON ts.database_name = t.TABLE_SCHEMA
+                     AND ts.table_name = t.TABLE_NAME
+                    WHERE t.TABLE_SCHEMA = %s
+                      AND t.TABLE_NAME = %s
+                    LIMIT 1
+                    """,
+                    (db, table),
+                )
+                row = cur.fetchone()
+            except Exception as exc:
+                log.warning(
+                    "MySQL 통계 나이 조회 실패, 갱신 건너뜀  (%s.%s): %s",
+                    db,
+                    table,
+                    exc,
+                )
+                return None
+
+        if not row or row[0] is None:
+            log.warning("MySQL 통계 나이 정보 없음, 갱신 건너뜀  (%s.%s)", db, table)
+            return None
+        return max(int(row[0]), 0)
+
+    def refresh_stale_table_stats(
+        self,
+        db_tables: dict[str, list[str]],
+        *,
+        max_age_seconds: int,
+    ) -> None:
+        pairs = [(db, table) for db, tables in db_tables.items() for table in tables]
+        if not pairs:
+            return
+
+        stale_tables: list[tuple[str, str, int | None]] = []
+        conn = self._make_admin_conn()
+        try:
+            for db, table in pairs:
+                age_seconds = self._get_table_stats_age_seconds(conn, db, table)
+                if age_seconds is None:
+                    continue
+                if age_seconds >= max_age_seconds:
+                    stale_tables.append((db, table, age_seconds))
+        finally:
+            conn.close()
+
+        if not stale_tables:
+            log.info("MySQL 통계 갱신 생략  (기준 %ds 내 최신)", max_age_seconds)
+            return
+
+        log.info(
+            "MySQL 통계 갱신 시작  (대상=%d, 기준=%ds)",
+            len(stale_tables),
+            max_age_seconds,
+        )
+        conn = self._make_admin_conn()
+        try:
+            with conn.cursor() as cur:
+                for db, table, age_seconds in stale_tables:
+                    age_label = "unknown" if age_seconds is None else f"{age_seconds}s"
+                    log.info("ANALYZE TABLE 실행  (%s.%s, stats_age=%s)", db, table, age_label)
+                    cur.execute(f"ANALYZE TABLE `{db}`.`{table}`")
+                    cur.fetchall()
+        finally:
+            conn.close()
+
+        log.info("MySQL 통계 갱신 완료  (대상=%d)", len(stale_tables))
 
     # ── 스냅숏 캡처 ───────────────────────────────────────────
 
@@ -185,11 +279,21 @@ class MySQLConnector(BaseDBConnector):
     # ── 통계 수집 ─────────────────────────────────────────────
 
     def _query_table_stats(self, db: str, table: str, conn: pymysql.Connection) -> dict:
-        """워커 커넥션 하나로 단일 테이블의 행 수·PK·MIN/MAX를 조회."""
+        """워커 커넥션 하나로 단일 테이블의 추정 행 수·PK·MIN/MAX를 조회."""
         with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM `{db}`.`{table}`")
-            count = cur.fetchone()[0]
-        log.debug("행 수  (%s.%s = %d)", db, table, count)
+            cur.execute(
+                """
+                SELECT COALESCE(TABLE_ROWS, 0)
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = %s
+                  AND TABLE_NAME = %s
+                LIMIT 1
+                """,
+                (db, table),
+            )
+            row = cur.fetchone()
+        count = int(row[0]) if row and row[0] is not None else 0
+        log.debug("추정 행 수  (%s.%s = %d)", db, table, count)
 
         with conn.cursor() as cur:
             cur.execute(
@@ -252,7 +356,7 @@ class MySQLConnector(BaseDBConnector):
         self, db_tables: dict[str, list[str]]
     ) -> tuple[dict, dict]:
         """
-        워커 커넥션 풀로 모든 테이블의 행 수·PK·MIN/MAX를 병렬 수집.
+        워커 커넥션 풀로 모든 테이블의 추정 행 수·PK·MIN/MAX를 병렬 수집.
 
         Returns:
             row_counts : {(db, table): int}

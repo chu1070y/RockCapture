@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -8,8 +9,10 @@ from pathlib import Path
 import yaml
 
 
+@lru_cache(maxsize=None)
 def _load_yaml(path: str) -> dict:
-    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    return data or {}
 
 
 # ── DB 설정 기반 클래스 ────────────────────────────────────────────
@@ -173,6 +176,7 @@ class PipelineConfig:
     large_table_threshold: int = 1_000_000
     large_table_batch_size: int = 1_000_000
     large_table_workers: int = 3
+    stats_max_age_seconds: int = 86_400
 
     @classmethod
     def from_yaml(cls, path: str = "pipeline.yaml") -> PipelineConfig:
@@ -183,6 +187,7 @@ class PipelineConfig:
             large_table_threshold=s.get("large_table_threshold", cls.large_table_threshold),
             large_table_batch_size=s.get("large_table_batch_size", cls.large_table_batch_size),
             large_table_workers=s.get("large_table_workers", cls.large_table_workers),
+            stats_max_age_seconds=s.get("stats_max_age_seconds", cls.stats_max_age_seconds),
         )
 
 
@@ -204,4 +209,5 @@ class SparkConfig:
             app_name=s.get("app_name", cls.app_name),
             log_level=s.get("log_level", cls.log_level),
             driver_memory=s.get("driver_memory", cls.driver_memory),
+            extra_packages=s.get("extra_packages", cls().extra_packages),
         )

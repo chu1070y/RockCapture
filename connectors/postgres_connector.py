@@ -104,6 +104,11 @@ class PostgreSQLConnector(BaseDBConnector):
                 "PostgreSQL 커넥션이 없습니다. connect() 또는 with 구문을 먼저 사용하세요."
             )
 
+    def _make_admin_autocommit_conn(self) -> psycopg2.extensions.connection:
+        conn = self._make_conn()
+        conn.autocommit = True
+        return conn
+
     # ── 스키마 / 테이블 목록 ──────────────────────────────────────
 
     def list_databases(self) -> list[str]:
@@ -141,6 +146,94 @@ class PostgreSQLConnector(BaseDBConnector):
             tables = [r[0] for r in cur.fetchall()]
         log.info("  └─ %s: 테이블 %d개  %s", database, len(tables), tables)
         return tables
+
+    def _get_table_stats_age_seconds(
+        self,
+        conn: psycopg2.extensions.connection,
+        schema: str,
+        table: str,
+    ) -> int | None:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT CASE
+                               WHEN COALESCE(s.last_autoanalyze, s.last_analyze) IS NULL THEN NULL
+                               ELSE GREATEST(
+                                   EXTRACT(
+                                       EPOCH FROM NOW() - COALESCE(s.last_autoanalyze, s.last_analyze)
+                                   )::bigint,
+                                   0
+                               )
+                           END
+                    FROM pg_class c
+                    JOIN pg_namespace n
+                      ON n.oid = c.relnamespace
+                    LEFT JOIN pg_stat_all_tables s
+                      ON s.relid = c.oid
+                    WHERE n.nspname = %s
+                      AND c.relname = %s
+                    LIMIT 1
+                    """,
+                    (schema, table),
+                )
+                row = cur.fetchone()
+            except Exception as exc:
+                log.warning(
+                    "PostgreSQL 통계 나이 조회 실패, 갱신 건너뜀  (%s.%s): %s",
+                    schema,
+                    table,
+                    exc,
+                )
+                return None
+
+        if not row or row[0] is None:
+            log.warning("PostgreSQL 통계 나이 정보 없음, 갱신 건너뜀  (%s.%s)", schema, table)
+            return None
+        return int(row[0])
+
+    def refresh_stale_table_stats(
+        self,
+        db_tables: dict[str, list[str]],
+        *,
+        max_age_seconds: int,
+    ) -> None:
+        pairs = [(schema, table) for schema, tables in db_tables.items() for table in tables]
+        if not pairs:
+            return
+
+        stale_tables: list[tuple[str, str, int | None]] = []
+        conn = self._make_admin_autocommit_conn()
+        try:
+            for schema, table in pairs:
+                age_seconds = self._get_table_stats_age_seconds(conn, schema, table)
+                if age_seconds is None:
+                    continue
+                if age_seconds >= max_age_seconds:
+                    stale_tables.append((schema, table, age_seconds))
+        finally:
+            conn.close()
+
+        if not stale_tables:
+            log.info("PostgreSQL 통계 갱신 생략  (기준 %ds 내 최신)", max_age_seconds)
+            return
+
+        log.info(
+            "PostgreSQL 통계 갱신 시작  (대상=%d, 기준=%ds)",
+            len(stale_tables),
+            max_age_seconds,
+        )
+        conn = self._make_admin_autocommit_conn()
+        try:
+            with conn.cursor() as cur:
+                for schema, table, age_seconds in stale_tables:
+                    age_label = "unknown" if age_seconds is None else f"{age_seconds}s"
+                    log.info("ANALYZE 실행  (%s.%s, stats_age=%s)", schema, table, age_label)
+                    cur.execute(f'ANALYZE "{schema}"."{table}"')
+        finally:
+            conn.close()
+
+        log.info("PostgreSQL 통계 갱신 완료  (대상=%d)", len(stale_tables))
 
     # ── 스냅숏 캡처 ───────────────────────────────────────────────
 
@@ -254,11 +347,22 @@ class PostgreSQLConnector(BaseDBConnector):
     def _query_table_stats(
         self, schema: str, table: str, conn: psycopg2.extensions.connection
     ) -> dict:
-        """워커 커넥션 하나로 단일 테이블의 행 수·PK·MIN/MAX를 조회."""
+        """워커 커넥션 하나로 단일 테이블의 추정 행 수·PK·MIN/MAX를 조회."""
         with conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
-            count = cur.fetchone()[0]
-        log.debug("행 수  (%s.%s = %d)", schema, table, count)
+            cur.execute(
+                """
+                SELECT COALESCE(c.reltuples, 0)
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                  AND c.relname = %s
+                LIMIT 1
+                """,
+                (schema, table),
+            )
+            row = cur.fetchone()
+        count = max(int(row[0]) if row and row[0] is not None else 0, 0)
+        log.debug("추정 행 수  (%s.%s = %d)", schema, table, count)
 
         with conn.cursor() as cur:
             cur.execute(
@@ -329,7 +433,7 @@ class PostgreSQLConnector(BaseDBConnector):
         self, db_tables: dict[str, list[str]]
     ) -> tuple[dict, dict, dict]:
         """
-        워커 커넥션 풀로 모든 테이블의 행 수·PK·MIN/MAX를 병렬 수집.
+        워커 커넥션 풀로 모든 테이블의 추정 행 수·PK·MIN/MAX를 병렬 수집.
 
         Returns:
             row_counts    : {(schema, table): int}
