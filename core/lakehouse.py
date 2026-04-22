@@ -249,6 +249,10 @@ class LakehousePipeline:
             )
             minio.write_iceberg(df, namespace, source_table)
 
+            if not (cancel_event and cancel_event.is_set()):
+                log.info("[filtered] Iceberg compaction 시작  (%s.%s)", source_db, source_table)
+                minio.compact_iceberg(spark, namespace, source_table)
+
         elapsed = int(time.monotonic() - _start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
         elapsed_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
