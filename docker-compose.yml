@@ -1,0 +1,14 @@
+services:
+  rockcapture:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rockcapture
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+      - ./logs:/app/logs
+      - ./tmp:/app/tmp
+      - ./metadata:/app/metadata
+    restart: unless-stopped

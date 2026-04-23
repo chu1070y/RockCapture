@@ -36,8 +36,33 @@ class SparkSessionManager:
         self._db_cfg = db_cfg
         self._minio_cfg = minio_cfg
         self._iceberg_cfg = iceberg_cfg
-        self._temp_dir = Path(temp_dir).resolve() if temp_dir else None
+        resolved_temp_dir = temp_dir or os.environ.get("SPARK_TEMP_DIR")
+        self._temp_dir = Path(resolved_temp_dir).resolve() if resolved_temp_dir else None
         self._session: SparkSession | None = None
+
+    @staticmethod
+    def _resolve_jar_paths(paths: list[str]) -> list[str]:
+        jar_paths: list[str] = []
+        for raw_path in paths:
+            jar_path = Path(raw_path).resolve()
+            if not jar_path.exists():
+                raise FileNotFoundError(f"Spark jar was not found: {jar_path}")
+            jar_paths.append(str(jar_path))
+        return jar_paths
+
+    def _spark_jars(self) -> list[str]:
+        return self._resolve_jar_paths(
+            [self._db_cfg.jdbc_jar_path, *self._spark_cfg.extra_jars]
+        )
+
+    def _ivy_cache_dir(self) -> str | None:
+        ivy_dir = self._spark_cfg.ivy_cache_dir or os.environ.get("SPARK_JARS_IVY")
+        if not ivy_dir:
+            return None
+
+        ivy_path = Path(ivy_dir).resolve()
+        ivy_path.mkdir(parents=True, exist_ok=True)
+        return str(ivy_path)
 
     def _stop_existing_sessions(self) -> None:
         active_session = SparkSession.getActiveSession()
@@ -76,11 +101,14 @@ class SparkSessionManager:
     def build(self) -> SparkSession:
         log.info("SparkSession 생성 시작  (app=%s)", self._spark_cfg.app_name)
 
-        jdbc_jar_path = str(Path(self._db_cfg.jdbc_jar_path).resolve())
+        spark_jars = self._spark_jars()
         spark_temp_dir = self._prepare_temp_dir()
-        log.debug("JDBC jar: %s", jdbc_jar_path)
+        ivy_cache_dir = self._ivy_cache_dir()
+        log.debug("Spark jars: %s", spark_jars)
         log.debug("extra packages: %s", self._spark_cfg.extra_packages)
         log.debug("MinIO endpoint: %s", self._minio_cfg.endpoint)
+        if ivy_cache_dir:
+            log.debug("Ivy cache dir: %s", ivy_cache_dir)
 
         catalog = self._iceberg_cfg.catalog_name
         self._stop_existing_sessions()
@@ -104,11 +132,7 @@ class SparkSessionManager:
             SparkSession.builder
             .appName(self._spark_cfg.app_name)
             .config("spark.driver.memory", self._spark_cfg.driver_memory)
-            .config("spark.jars", jdbc_jar_path)
-            .config(
-                "spark.jars.packages",
-                ",".join(self._spark_cfg.extra_packages),
-            )
+            .config("spark.jars", ",".join(spark_jars))
             .config("spark.hadoop.fs.s3a.endpoint", self._minio_cfg.endpoint)
             .config("spark.hadoop.fs.s3a.access.key", self._minio_cfg.access_key)
             .config("spark.hadoop.fs.s3a.secret.key", self._minio_cfg.secret_key)
@@ -134,6 +158,13 @@ class SparkSessionManager:
             .config("spark.scheduler.mode", "FAIR")
             .config("spark.driver.extraJavaOptions", " ".join(java_options))
         )
+        if self._spark_cfg.extra_packages:
+            builder = builder.config(
+                "spark.jars.packages",
+                ",".join(self._spark_cfg.extra_packages),
+            )
+        if ivy_cache_dir:
+            builder = builder.config("spark.jars.ivy", ivy_cache_dir)
         if spark_temp_dir:
             builder = (
                 builder

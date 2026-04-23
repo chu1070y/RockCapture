@@ -196,6 +196,8 @@ class SparkConfig:
     app_name: str = "LakeHouse"
     log_level: str = "WARN"
     driver_memory: str = "4g"
+    extra_jars: list[str] = field(default_factory=list)
+    ivy_cache_dir: str | None = None
     extra_packages: list[str] = field(default_factory=lambda: [
         "org.apache.hadoop:hadoop-aws:3.4.1",
         "com.amazonaws:aws-java-sdk-bundle:1.12.720",
@@ -209,5 +211,7 @@ class SparkConfig:
             app_name=s.get("app_name", cls.app_name),
             log_level=s.get("log_level", cls.log_level),
             driver_memory=s.get("driver_memory", cls.driver_memory),
+            extra_jars=s.get("extra_jars", cls().extra_jars),
+            ivy_cache_dir=s.get("ivy_cache_dir", cls.ivy_cache_dir),
             extra_packages=s.get("extra_packages", cls().extra_packages),
         )

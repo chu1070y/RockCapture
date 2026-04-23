@@ -1,9 +1,10 @@
+import os
 import logging
 import threading
 from datetime import datetime
 from pathlib import Path
 
-LOG_DIR = Path("logs")
+LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
 
 _FMT = "%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
@@ -30,7 +31,7 @@ def setup_logging(level: int = logging.INFO) -> None:
                 logging.getLogger(noisy).setLevel(logging.WARNING)
             return
 
-        LOG_DIR.mkdir(exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
 
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = LOG_DIR / f"lakehouse_{run_ts}.log"

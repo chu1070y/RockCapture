@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -58,8 +59,8 @@ class SnapshotMetadata:
 class MetadataWriter:
     """스냅숏 메타데이터를 로컬 파일 / MinIO에 저장"""
 
-    def __init__(self, output_dir: str = "metadata"):
-        self._output_dir = Path(output_dir)
+    def __init__(self, output_dir: str | None = None):
+        self._output_dir = Path(output_dir or os.environ.get("METADATA_DIR", "metadata"))
 
     @staticmethod
     def _file_name(meta: SnapshotMetadata) -> str:

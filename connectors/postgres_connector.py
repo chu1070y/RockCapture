@@ -207,9 +207,7 @@ class PostgreSQLConnector(BaseDBConnector):
         try:
             for schema, table in pairs:
                 age_seconds = self._get_table_stats_age_seconds(conn, schema, table)
-                if age_seconds is None:
-                    continue
-                if age_seconds >= max_age_seconds:
+                if age_seconds is None or age_seconds >= max_age_seconds:
                     stale_tables.append((schema, table, age_seconds))
         finally:
             conn.close()

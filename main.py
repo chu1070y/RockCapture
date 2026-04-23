@@ -16,11 +16,11 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from queue import Empty
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, model_validator
 
 from core.lakehouse import LakehousePipeline
 from core.logger import get_logger
@@ -94,13 +94,76 @@ class JobInfo(BaseModel):
     cancelled_at: Optional[str] = None
 
 
+class FilterCondition(BaseModel):
+    field: str = Field(..., description="Column name")
+    op: Literal[
+        "eq",
+        "ne",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "like",
+        "in",
+        "between",
+        "is_null",
+        "is_not_null",
+    ] = Field(..., description="Allowed comparison operator")
+    value: Any | list[Any] | None = Field(
+        None,
+        description="Comparison value. Use list for in/between.",
+    )
+
+    @model_validator(mode="after")
+    def validate_value(self) -> "FilterCondition":
+        if self.op in {"is_null", "is_not_null"}:
+            if self.value is not None:
+                raise ValueError(f"'{self.op}' does not accept a value.")
+            return self
+
+        if self.value is None:
+            raise ValueError(f"'{self.op}' requires a value.")
+
+        if self.op == "in":
+            if not isinstance(self.value, list) or not self.value:
+                raise ValueError("'in' requires a non-empty list value.")
+        elif self.op == "between":
+            if not isinstance(self.value, list) or len(self.value) != 2:
+                raise ValueError("'between' requires a list with exactly two values.")
+        elif isinstance(self.value, list):
+            raise ValueError(f"'{self.op}' does not accept a list value.")
+
+        return self
+
+
+class FilterGroup(BaseModel):
+    logic: Literal["and", "or"] = Field(
+        "and",
+        description="How to combine conditions and child groups",
+    )
+    conditions: list[FilterCondition] = Field(default_factory=list)
+    groups: list["FilterGroup"] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_not_empty(self) -> "FilterGroup":
+        if not self.conditions and not self.groups:
+            raise ValueError("Filter group must contain at least one condition or child group.")
+        return self
+
+
+FilterGroup.model_rebuild()
+
+
 class FilteredSnapshotRequest(PipelineRequest):
     source_db: str = Field(
         ...,
         description="MySQL database name or PostgreSQL schema name",
     )
     source_table: str = Field(..., description="Source table name")
-    where_clause: str = Field(..., description="SQL WHERE clause without the WHERE keyword")
+    filter_group: FilterGroup = Field(
+        ...,
+        description="Structured filter definition combined with and/or groups",
+    )
 
 
 def _build_pipeline(req_data: dict[str, Any]) -> LakehousePipeline:
@@ -130,7 +193,7 @@ def _run_pipeline_process(
             elapsed_str = pipeline.run_filtered_snapshot(
                 source_db=req_data["source_db"],
                 source_table=req_data["source_table"],
-                where_clause=req_data["where_clause"],
+                filter_group=req_data["filter_group"],
                 cancel_event=cancel_event,
             )
         else:
@@ -368,7 +431,8 @@ async def get_status(job_id: str):
     response_model=list[JobInfo],
     summary="List jobs",
 )
-async def list_jobs():
+async def list_jobs(request: Request):
+    log.info("Job list requested  (url=%s)", request.url)
     with _jobs_lock:
         return [JobInfo(**job) for job in _jobs.values()]
 

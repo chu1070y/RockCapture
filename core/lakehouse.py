@@ -212,7 +212,7 @@ class LakehousePipeline:
         self,
         source_db: str,
         source_table: str,
-        where_clause: str,
+        filter_group: dict,
         cancel_event: threading.Event | None = None,
     ) -> str:
         _start = time.monotonic()
@@ -238,7 +238,7 @@ class LakehousePipeline:
                 self._db_cfg,
                 source_db,
                 source_table,
-                where_clause,
+                filter_group,
             )
 
             minio = MinIOConnector(self._minio_cfg, self._iceberg_cfg)

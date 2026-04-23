@@ -12,9 +12,11 @@ Spark JDBC가 sessionInitStatement로 자체 일관된 스냅숏을 확보하여
 from __future__ import annotations
 
 import math
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import date, datetime
 from queue import Empty, Queue
 
 from pyspark.sql import SparkSession
@@ -25,6 +27,8 @@ from connectors.metadata_writer import SnapshotMetadata, TableResult
 from core.logger import get_logger
 
 log = get_logger(__name__)
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ── 데이터 ───────────────────────────────────────────────────
@@ -101,14 +105,91 @@ def _read_jdbc(
     return spark.read.format("jdbc").options(**opts).load()
 
 
+def _sql_literal(value: object) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (date, datetime)):
+        return f"'{value.isoformat()}'"
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    raise ValueError(f"Unsupported filter value type: {type(value).__name__}")
+
+
+def _column_ref_from_filter(field: str, db_cfg: BaseDBConfig) -> str:
+    if not _SAFE_IDENTIFIER_RE.fullmatch(field):
+        raise ValueError(f"Unsupported column name: '{field}'")
+    return db_cfg.column_ref(field)
+
+
+def _condition_to_sql(condition: dict[str, object], db_cfg: BaseDBConfig) -> str:
+    field = str(condition["field"])
+    op = str(condition["op"])
+    value = condition.get("value")
+    col_ref = _column_ref_from_filter(field, db_cfg)
+
+    simple_ops = {
+        "eq": "=",
+        "ne": "!=",
+        "gt": ">",
+        "gte": ">=",
+        "lt": "<",
+        "lte": "<=",
+        "like": "LIKE",
+    }
+
+    if op in simple_ops:
+        return f"{col_ref} {simple_ops[op]} {_sql_literal(value)}"
+    if op == "in":
+        if not isinstance(value, list) or not value:
+            raise ValueError("'in' requires a non-empty list value.")
+        values_sql = ", ".join(_sql_literal(item) for item in value)
+        return f"{col_ref} IN ({values_sql})"
+    if op == "between":
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError("'between' requires exactly two values.")
+        return f"{col_ref} BETWEEN {_sql_literal(value[0])} AND {_sql_literal(value[1])}"
+    if op == "is_null":
+        return f"{col_ref} IS NULL"
+    if op == "is_not_null":
+        return f"{col_ref} IS NOT NULL"
+    raise ValueError(f"Unsupported filter operator: '{op}'")
+
+
+def _filter_group_to_sql(group: dict[str, object], db_cfg: BaseDBConfig) -> str:
+    logic = str(group.get("logic", "and")).upper()
+    if logic not in {"AND", "OR"}:
+        raise ValueError(f"Unsupported filter logic: '{group.get('logic')}'")
+
+    parts: list[str] = []
+    for condition in group.get("conditions", []):
+        if not isinstance(condition, dict):
+            raise ValueError("Each condition must be an object.")
+        parts.append(_condition_to_sql(condition, db_cfg))
+
+    for child_group in group.get("groups", []):
+        if not isinstance(child_group, dict):
+            raise ValueError("Each child group must be an object.")
+        parts.append(_filter_group_to_sql(child_group, db_cfg))
+
+    if not parts:
+        raise ValueError("Filter group must contain at least one condition or child group.")
+
+    return "(" + f" {logic} ".join(parts) + ")"
+
+
 def read_jdbc_where(
     spark: SparkSession,
     db_cfg: BaseDBConfig,
     db: str,
     table: str,
-    where_clause: str,
+    filter_group: dict[str, object],
     fetch_size: int = 10_000,
 ):
+    where_clause = _filter_group_to_sql(filter_group, db_cfg)
     query = (
         f"(SELECT * FROM {db_cfg.fqn(db, table)} "
         f"WHERE {where_clause}) AS filtered_snapshot"
