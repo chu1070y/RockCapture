@@ -5,6 +5,7 @@ ARG PREFETCH_SPARK_PACKAGES=1
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app \
     JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
     SPARK_LOCAL_HOSTNAME=localhost \
     SPARK_LOCAL_IP=127.0.0.1 \
@@ -28,7 +29,7 @@ RUN pip install --upgrade pip \
 COPY . .
 
 RUN mkdir -p /app/logs /app/tmp /app/metadata /app/.ivy2 \
-    && if [ "$PREFETCH_SPARK_PACKAGES" = "1" ]; then python scripts/prefetch_spark_packages.py; fi
+    && if [ "$PREFETCH_SPARK_PACKAGES" = "1" ]; then python -m scripts.prefetch_spark_packages; fi
 
 EXPOSE 8000
 
