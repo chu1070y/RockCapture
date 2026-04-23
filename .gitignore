@@ -1,5 +1,5 @@
 # 민감한 설정 파일 (DB 비밀번호, MinIO 키 등 포함)
-pipeline.yaml
+# pipeline.yaml
 
 # Python
 **/__pycache__/
