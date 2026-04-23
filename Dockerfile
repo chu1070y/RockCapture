@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app \
+    TZ=Asia/Seoul \
     JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
     SPARK_LOCAL_HOSTNAME=localhost \
     SPARK_LOCAL_IP=127.0.0.1 \
@@ -20,7 +21,10 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
+        tzdata \
         tini \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

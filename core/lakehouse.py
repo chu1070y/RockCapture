@@ -119,6 +119,10 @@ class LakehousePipeline:
 
     def run(self, cancel_event: threading.Event | None = None) -> str:
         _start = time.monotonic()
+        log.info(
+            "===== 전체 테이블 스냅샷 시작  (DB 타입: %s) =====",
+            self._db_type,
+        )
         log.info("===== LakeHouse 파이프라인 시작 =====")
         log.info(
             "DB 타입: %s  |  host=%s:%s  |  user=%s",

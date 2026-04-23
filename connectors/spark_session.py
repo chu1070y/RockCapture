@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from pyspark.sql import SparkSession
@@ -37,7 +38,8 @@ class SparkSessionManager:
         self._minio_cfg = minio_cfg
         self._iceberg_cfg = iceberg_cfg
         resolved_temp_dir = temp_dir or os.environ.get("SPARK_TEMP_DIR")
-        self._temp_dir = Path(resolved_temp_dir).resolve() if resolved_temp_dir else None
+        self._temp_root_dir = Path(resolved_temp_dir).resolve() if resolved_temp_dir else None
+        self._temp_dir: Path | None = None
         self._session: SparkSession | None = None
 
     @staticmethod
@@ -109,11 +111,17 @@ class SparkSessionManager:
             default_session.stop()
 
     def _prepare_temp_dir(self) -> str | None:
-        if self._temp_dir is None:
+        if self._temp_root_dir is None:
             return None
 
+        self._temp_root_dir.mkdir(parents=True, exist_ok=True)
+        self._temp_dir = self._temp_root_dir / f"spark-session-{uuid.uuid4()}"
         self._temp_dir.mkdir(parents=True, exist_ok=True)
-        log.info("Using project-local Spark temp dir: %s", self._temp_dir)
+        log.info(
+            "Using project-local Spark temp dir: %s (root=%s)",
+            self._temp_dir,
+            self._temp_root_dir,
+        )
         return str(self._temp_dir)
 
     def _cleanup_temp_dir(self) -> None:
@@ -124,6 +132,7 @@ class SparkSessionManager:
             try:
                 shutil.rmtree(self._temp_dir)
                 log.info("Removed Spark temp dir: %s", self._temp_dir)
+                self._temp_dir = None
                 return
             except OSError as exc:
                 if attempt == 5:
