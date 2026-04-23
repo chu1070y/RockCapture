@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SPARK_LOCAL_IP=127.0.0.1 \
     SPARK_TEMP_DIR=/app/tmp \
     SPARK_JARS_IVY=/app/.ivy2 \
+    SPARK_BUNDLED_JARS_DIR=/app/spark-jars \
     LOG_DIR=/app/logs \
     METADATA_DIR=/app/metadata
 
@@ -28,7 +29,7 @@ RUN pip install --upgrade pip \
 
 COPY . .
 
-RUN mkdir -p /app/logs /app/tmp /app/metadata /app/.ivy2 \
+RUN mkdir -p /app/logs /app/tmp /app/metadata /app/.ivy2 /app/spark-jars \
     && if [ "$PREFETCH_SPARK_PACKAGES" = "1" ]; then python -m scripts.prefetch_spark_packages; fi
 
 EXPOSE 8000

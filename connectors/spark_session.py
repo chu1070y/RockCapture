@@ -51,8 +51,22 @@ class SparkSessionManager:
         return jar_paths
 
     def _spark_jars(self) -> list[str]:
+        bundled_jars_dir = (
+            self._spark_cfg.bundled_jars_dir
+            or os.environ.get("SPARK_BUNDLED_JARS_DIR")
+        )
+        bundled_jars: list[str] = []
+        if bundled_jars_dir:
+            bundled_dir = Path(bundled_jars_dir).resolve()
+            if bundled_dir.exists():
+                bundled_jars = [
+                    str(path.resolve())
+                    for path in sorted(bundled_dir.glob("*.jar"))
+                    if path.is_file()
+                ]
+
         return self._resolve_jar_paths(
-            [self._db_cfg.jdbc_jar_path, *self._spark_cfg.extra_jars]
+            [self._db_cfg.jdbc_jar_path, *self._spark_cfg.extra_jars, *bundled_jars]
         )
 
     def _ivy_cache_dir(self) -> str | None:
@@ -63,6 +77,25 @@ class SparkSessionManager:
         ivy_path = Path(ivy_dir).resolve()
         ivy_path.mkdir(parents=True, exist_ok=True)
         return str(ivy_path)
+
+    def _should_resolve_packages(self, spark_jars: list[str]) -> bool:
+        if os.environ.get("SPARK_FORCE_PACKAGE_RESOLVE", "").lower() in {"1", "true", "yes"}:
+            return True
+
+        if not self._spark_cfg.extra_packages:
+            return False
+
+        bundled_jars_dir = (
+            self._spark_cfg.bundled_jars_dir
+            or os.environ.get("SPARK_BUNDLED_JARS_DIR")
+        )
+        if bundled_jars_dir:
+            bundled_dir = Path(bundled_jars_dir).resolve()
+            if bundled_dir.exists() and any(bundled_dir.glob("*.jar")):
+                log.info("Using bundled Spark package jars from %s", bundled_dir)
+                return False
+
+        return len(spark_jars) <= 1
 
     def _stop_existing_sessions(self) -> None:
         active_session = SparkSession.getActiveSession()
@@ -158,7 +191,7 @@ class SparkSessionManager:
             .config("spark.scheduler.mode", "FAIR")
             .config("spark.driver.extraJavaOptions", " ".join(java_options))
         )
-        if self._spark_cfg.extra_packages:
+        if self._should_resolve_packages(spark_jars):
             builder = builder.config(
                 "spark.jars.packages",
                 ",".join(self._spark_cfg.extra_packages),
