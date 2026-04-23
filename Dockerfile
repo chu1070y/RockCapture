@@ -34,6 +34,8 @@ RUN pip install --upgrade pip \
 COPY . .
 
 RUN mkdir -p /app/logs /app/tmp /app/metadata /app/.ivy2 /app/spark-jars \
+    && chgrp -R 0 /app \
+    && chmod -R g=u /app \
     && if [ "$PREFETCH_SPARK_PACKAGES" = "1" ]; then python -m scripts.prefetch_spark_packages; fi
 
 EXPOSE 8000
